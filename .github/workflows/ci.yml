@@ -1,8 +1,11 @@
 name: CI
 
+# push runs only on long-lived branches; the pull_request trigger covers
+# feature branches ('*' did not match slash-named branches and double-ran
+# flat-named branches with open PRs)
 on:
   push:
-    branches: ['*']
+    branches: [main, dev]
   pull_request:
     branches: ['*']
 
@@ -206,10 +209,15 @@ jobs:
     name: MCP Integration Tests
     runs-on: ubuntu-latest
     needs: [lint, test]
-    # Skip for fork PRs — secrets (ODOO_APPS_PAT) are not available
+    # Skip for fork PRs AND Dependabot PRs — repository secrets
+    # (ODOO_APPS_PAT) are not available to either: forks never get them,
+    # and Dependabot-triggered workflows read from the separate (empty)
+    # Dependabot secrets store. Lint/unit/YOLO jobs still cover those PRs.
     if: |
       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'))
-      || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+      || (github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && github.actor != 'dependabot[bot]')
 
     services:
       postgres:
@@ -393,7 +401,7 @@ jobs:
         python-version: '3.10'
 
     - name: Merge and upload coverage
-      uses: codecov/codecov-action@v6
+      uses: codecov/codecov-action@v7
       with:
         directory: coverage-reports
         flags: all

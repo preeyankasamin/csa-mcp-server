@@ -88,6 +88,184 @@ class TestOdooToolHandler:
         }
         assert set(mock_app._tools.keys()) == expected_tools
 
+    def test_parse_domain_preserves_true_false_in_string_values(self, handler):
+        """Python-literal domains keep 'True'/'False' substrings inside values intact."""
+        parsed = handler._parse_domain_input("[['name', '=', 'True North']]")
+        assert parsed == [["name", "=", "True North"]]
+
+        parsed = handler._parse_domain_input(
+            "[('active', '=', False), ('name', 'like', 'False Bay')]"
+        )
+        assert parsed == [("active", "=", False), ("name", "like", "False Bay")]
+
+    def test_parse_domain_json_string(self, handler):
+        parsed = handler._parse_domain_input('[["is_company", "=", true]]')
+        assert parsed == [["is_company", "=", True]]
+
+    def test_parse_domain_rejects_non_list_inputs(self, handler):
+        for bad in ({"name": "x"}, 42, True):
+            with pytest.raises(ValidationError, match="Domain must be a list"):
+                handler._parse_domain_input(bad)
+        with pytest.raises(ValidationError, match="Invalid domain"):
+            handler._parse_domain_input("not a domain at all")
+
+    @pytest.mark.asyncio
+    async def test_search_rejects_negative_offset(
+        self, handler, mock_connection, mock_access_controller
+    ):
+        with pytest.raises(ValidationError, match="offset must be >= 0"):
+            await handler._handle_search_tool("res.partner", None, None, 10, -5, None)
+
+    @pytest.mark.asyncio
+    async def test_aggregate_rejects_negative_offset(
+        self, handler, mock_connection, mock_access_controller
+    ):
+        with pytest.raises(ValidationError, match="offset must be >= 0"):
+            await handler._handle_aggregate_records_tool(
+                "res.partner", ["country_id"], None, None, None, 10, -1
+            )
+
+    @pytest.mark.asyncio
+    async def test_search_serializes_binary_and_datetime_values(
+        self, handler, mock_connection, mock_access_controller
+    ):
+        """Binary/DateTime XML-RPC values are coerced to JSON-safe types."""
+        import json as json_mod
+        import xmlrpc.client
+
+        binary = xmlrpc.client.Binary(b"\x89PNG fake image")
+        stamp = xmlrpc.client.DateTime("20260610T12:00:00")
+        mock_connection.search_count.return_value = 1
+        mock_connection.search.return_value = [1]
+        mock_connection.fields_get.return_value = {}
+        mock_connection.read.return_value = [
+            {"id": 1, "image_1920": binary, "write_date": stamp, "name": "A"}
+        ]
+
+        result = await handler._handle_search_tool(
+            "res.partner", None, ["name", "image_1920", "write_date"], 10, 0, None
+        )
+
+        record = result["records"][0]
+        assert isinstance(record["image_1920"], str)  # base64, not Binary
+        assert isinstance(record["write_date"], str)
+        json_mod.dumps(result["records"])  # must be JSON-serializable end-to-end
+
+    @pytest.mark.asyncio
+    async def test_get_record_serializes_binary_values(
+        self, handler, mock_connection, mock_access_controller
+    ):
+        import xmlrpc.client
+
+        mock_connection.read.return_value = [
+            {"id": 7, "image_1920": xmlrpc.client.Binary(b"data"), "name": "B"}
+        ]
+        mock_connection.fields_get.return_value = {}
+
+        result = await handler._handle_get_record_tool("res.partner", 7, ["name", "image_1920"])
+        assert isinstance(result.record["image_1920"], str)
+
+    @pytest.mark.asyncio
+    async def test_search_empty_fields_list_uses_smart_defaults(
+        self, handler, mock_connection, mock_access_controller
+    ):
+        """fields=[] must trigger smart defaults, never an unfiltered read."""
+        mock_connection.search_count.return_value = 1
+        mock_connection.search.return_value = [1]
+        mock_connection.fields_get.return_value = {
+            "name": {"type": "char", "store": True},
+            "email": {"type": "char", "store": True},
+        }
+        mock_connection.read.return_value = [{"id": 1, "name": "A"}]
+
+        await handler._handle_search_tool("res.partner", None, [], 10, 0, None)
+
+        fields_arg = mock_connection.read.call_args[0][2]
+        assert fields_arg, "read must receive a concrete field list, not None/[] (= all fields)"
+
+    @pytest.mark.asyncio
+    async def test_get_record_empty_fields_list_uses_smart_defaults(
+        self, handler, mock_connection, mock_access_controller
+    ):
+        mock_connection.fields_get.return_value = {
+            "name": {"type": "char", "store": True},
+        }
+        mock_connection.read.return_value = [{"id": 1, "name": "A"}]
+
+        result = await handler._handle_get_record_tool("res.partner", 1, [])
+
+        fields_arg = mock_connection.read.call_args[0][2]
+        assert fields_arg, "read must receive a concrete field list, not None/[] (= all fields)"
+        assert result.metadata is not None  # smart-defaults metadata attached
+
+    @pytest.mark.asyncio
+    async def test_list_resource_templates_standard_mode(
+        self, handler, mock_connection, mock_access_controller
+    ):
+        mock_access_controller.get_enabled_models.return_value = [
+            {"model": "res.partner", "name": "Contact"},
+            {"model": "sale.order", "name": "Sales Order"},
+        ]
+
+        result = await handler._handle_list_resource_templates_tool()
+
+        assert result["enabled_models"] == ["res.partner", "sale.order"]
+        assert result["total_models"] == 2
+        assert len(result["templates"]) == 4
+
+    @pytest.mark.asyncio
+    async def test_list_resource_templates_yolo_mode(
+        self, mock_app, mock_connection, mock_access_controller
+    ):
+        """YOLO mode reports all-models-available, not total_models=0."""
+        from mcp_server_odoo.tools import OdooToolHandler
+
+        yolo_config = OdooConfig(
+            url="http://localhost:8069",
+            username="admin",
+            password="admin",
+            database="test_db",
+            yolo_mode="read",
+        )
+        handler = OdooToolHandler(mock_app, mock_connection, mock_access_controller, yolo_config)
+        mock_access_controller.get_enabled_models.return_value = []
+
+        result = await handler._handle_list_resource_templates_tool()
+
+        assert result["total_models"] is None
+        assert "YOLO mode: ALL models are available" in result["note"]
+
+    @pytest.mark.asyncio
+    async def test_event_loop_not_blocked_by_connection_calls(
+        self, handler, mock_connection, mock_access_controller
+    ):
+        """Blocking connection calls run in worker threads, keeping the loop responsive."""
+        import asyncio
+        import time
+
+        def slow_search_count(*args, **kwargs):
+            time.sleep(0.2)  # blocks its worker thread, must not block the loop
+            return 0
+
+        mock_connection.search_count.side_effect = slow_search_count
+        mock_connection.search.return_value = []
+        mock_connection.read.return_value = []
+        mock_connection.fields_get.return_value = {}
+
+        start = time.monotonic()
+        search_task = asyncio.create_task(
+            handler._handle_search_tool("res.partner", None, None, 10, 0, None)
+        )
+        # An independent awaitable must make progress while the RPC blocks.
+        await asyncio.sleep(0.01)
+        heartbeat_elapsed = time.monotonic() - start
+
+        result = await search_task
+        assert result["records"] == []
+        assert heartbeat_elapsed < 0.15, (
+            f"event loop was blocked for {heartbeat_elapsed:.3f}s by a synchronous RPC"
+        )
+
     @pytest.mark.asyncio
     async def test_search_records_success(
         self, handler, mock_connection, mock_access_controller, mock_app
@@ -309,7 +487,7 @@ class TestOdooToolHandler:
         with pytest.raises(ValidationError) as exc_info:
             await search_records(model="res.partner", domain=invalid_domain, limit=5)
 
-        assert "Invalid search criteria format" in str(exc_info.value)
+        assert "Invalid domain parameter" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_search_records_with_string_fields(
@@ -2530,9 +2708,6 @@ class TestCallModelMethodTool:
         mock_connection.execute_kw.assert_called_once_with(
             "account.move", "action_post", [[42]], {}
         )
-        mock_connection.performance_manager.invalidate_record_cache.assert_called_once_with(
-            "account.move"
-        )
 
     @pytest.mark.asyncio
     async def test_native_kwargs_passed_through(
@@ -2765,9 +2940,6 @@ class TestCallModelMethodTool:
 
         assert result.success is True
         assert result.result is None
-        mock_connection.performance_manager.invalidate_record_cache.assert_called_once_with(
-            "res.partner"
-        )
 
     @pytest.mark.asyncio
     async def test_not_authenticated_rejected(

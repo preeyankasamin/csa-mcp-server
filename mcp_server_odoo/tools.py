@@ -5,6 +5,7 @@ Tools are different from resources - they can have side effects and perform
 actions like creating, updating, or deleting records.
 """
 
+import asyncio
 import base64
 import json
 import re
@@ -16,7 +17,11 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
-from .access_control import AccessControlError, AccessController
+from .access_control import (
+    AccessControlError,
+    AccessController,
+    AccessControlUnavailableError,
+)
 from .config import OdooConfig
 from .error_handling import (
     NotFoundError,
@@ -354,23 +359,22 @@ class OdooToolHandler:
         if domain is None:
             return []
         if not isinstance(domain, str):
+            if not isinstance(domain, list):
+                raise ValidationError(f"Domain must be a list, got {type(domain).__name__}")
             return domain
 
         try:
             parsed = json.loads(domain)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            # literal_eval handles single quotes and True/False natively,
+            # without corrupting those substrings inside quoted values.
             try:
-                json_domain = domain.replace("'", '"')
-                json_domain = json_domain.replace("True", "true").replace("False", "false")
-                parsed = json.loads(json_domain)
-            except json.JSONDecodeError as e:
-                try:
-                    parsed = _parse_python_literal(domain)
-                except (ValueError, SyntaxError):
-                    raise ValidationError(
-                        f"Invalid domain parameter. Expected JSON array or Python list, "
-                        f"got: {domain[:100]}..."
-                    ) from e
+                parsed = _parse_python_literal(domain)
+            except (ValueError, SyntaxError):
+                raise ValidationError(
+                    f"Invalid domain parameter. Expected JSON array or Python list, "
+                    f"got: {domain[:100]}..."
+                ) from e
 
         if not isinstance(parsed, list):
             raise ValidationError(f"Domain must be a list, got {type(parsed).__name__}")
@@ -435,7 +439,8 @@ class OdooToolHandler:
                     - None (default): Returns smart selection of common fields
                     - A list: ["field1", "field2", ...] - Returns only specified fields
                     - A JSON string: '["field1", "field2"]' - Parsed to list
-                    - ["__all__"] or '["__all__"]': Returns ALL fields (warning: may cause serialization errors)
+                    - An empty list []: Treated like None (smart defaults)
+                    - ["__all__"] or '["__all__"]': Returns ALL fields (warning: may be slow)
                 limit: Maximum number of records to return. Omit to use the
                     server-configured default (ODOO_MCP_DEFAULT_LIMIT). Capped
                     at ODOO_MCP_MAX_LIMIT.
@@ -476,6 +481,7 @@ class OdooToolHandler:
                 fields: Field selection options:
                     - None (default): Returns smart selection of common fields
                     - ["field1", "field2", ...]: Returns only specified fields
+                    - An empty list []: Treated like None (smart defaults)
                     - ["__all__"]: Returns ALL fields (warning: can be very large)
 
             Workflow for field discovery:
@@ -811,7 +817,7 @@ class OdooToolHandler:
         try:
             with perf_logger.track_operation("tool_search", model=model):
                 # Check model access
-                self.access_controller.validate_model_access(model, "read")
+                await asyncio.to_thread(self.access_controller.validate_model_access, model, "read")
                 await self._ctx_info(ctx, f"Searching {model}...")
 
                 # Ensure we're connected
@@ -851,20 +857,32 @@ class OdooToolHandler:
                 elif limit > self.config.max_limit:
                     limit = self.config.max_limit
 
+                if offset < 0:
+                    raise ValidationError(f"offset must be >= 0, got {offset}")
+
                 # Get total count
-                total_count = self.connection.search_count(model, parsed_domain)
+                total_count = await asyncio.to_thread(
+                    self.connection.search_count, model, parsed_domain
+                )
                 await self._ctx_progress(ctx, 1, 3, f"Found {total_count} records")
 
                 # Search for records
-                record_ids = self.connection.search(
-                    model, parsed_domain, limit=limit, offset=offset, order=order
+                record_ids = await asyncio.to_thread(
+                    self.connection.search,
+                    model,
+                    parsed_domain,
+                    limit=limit,
+                    offset=offset,
+                    order=order,
                 )
 
-                # Determine which fields to fetch
+                # Determine which fields to fetch. An empty list means
+                # "minimal/default" — Odoo would interpret [] as ALL fields,
+                # so treat it like None (smart defaults).
                 fields_to_fetch = parsed_fields
-                if parsed_fields is None:
+                if parsed_fields is None or parsed_fields == []:
                     # Use smart field selection to avoid serialization issues
-                    fields_to_fetch = self._get_smart_default_fields(model)
+                    fields_to_fetch = await asyncio.to_thread(self._get_smart_default_fields, model)
                     await self._ctx_info(ctx, f"Using smart field defaults for {model}")
                     logger.debug(
                         f"Using smart defaults for {model} search: {len(fields_to_fetch) if fields_to_fetch else 'all'} fields"
@@ -881,9 +899,15 @@ class OdooToolHandler:
                 # Read records
                 records = []
                 if record_ids:
-                    records = self.connection.read(model, record_ids, fields_to_fetch)
+                    records = await asyncio.to_thread(
+                        self.connection.read, model, record_ids, fields_to_fetch
+                    )
                     # Process datetime fields in each record
-                    records = [self._process_record_dates(record, model) for record in records]
+                    records = await asyncio.to_thread(
+                        lambda: [self._process_record_dates(record, model) for record in records]
+                    )
+                    # Coerce XML-RPC types (Binary, DateTime) Pydantic can't serialize
+                    records = [_json_safe(record) for record in records]
                 await self._ctx_info(ctx, f"Returning {len(records)} records")
 
                 return {
@@ -894,6 +918,10 @@ class OdooToolHandler:
                     "model": model,
                 }
 
+        except ValidationError:
+            raise
+        except AccessControlUnavailableError as e:
+            raise ValidationError(f"Could not verify access (connection error): {e}") from e
         except AccessControlError as e:
             raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
@@ -914,7 +942,7 @@ class OdooToolHandler:
         try:
             with perf_logger.track_operation("tool_get_record", model=model):
                 # Check model access
-                self.access_controller.validate_model_access(model, "read")
+                await asyncio.to_thread(self.access_controller.validate_model_access, model, "read")
                 await self._ctx_info(ctx, f"Getting {model}/{record_id}...")
 
                 # Ensure we're connected
@@ -927,9 +955,10 @@ class OdooToolHandler:
                 total_fields = None
                 field_selection_method = "explicit"
 
-                if fields is None:
-                    # Use smart field selection
-                    fields_to_fetch = self._get_smart_default_fields(model)
+                if fields is None or fields == []:
+                    # Use smart field selection. An empty list means
+                    # "minimal/default" — Odoo would interpret [] as ALL fields.
+                    fields_to_fetch = await asyncio.to_thread(self._get_smart_default_fields, model)
                     use_smart_defaults = True
                     field_selection_method = "smart_defaults"
                     logger.debug(
@@ -945,19 +974,23 @@ class OdooToolHandler:
                     logger.debug(f"Fetching specific fields for {model}: {fields}")
 
                 # Read the record
-                records = self.connection.read(model, [record_id], fields_to_fetch)
+                records = await asyncio.to_thread(
+                    self.connection.read, model, [record_id], fields_to_fetch
+                )
 
                 if not records:
                     raise ValidationError(f"Record not found: {model} with ID {record_id}")
 
                 # Process datetime fields in the record
-                record = self._process_record_dates(records[0], model)
+                record = await asyncio.to_thread(self._process_record_dates, records[0], model)
+                # Coerce XML-RPC types (Binary, DateTime) Pydantic can't serialize
+                record = _json_safe(record)
 
                 # Build metadata when using smart defaults
                 metadata = None
                 if use_smart_defaults:
                     try:
-                        all_fields_info = self.connection.fields_get(model)
+                        all_fields_info = await asyncio.to_thread(self.connection.fields_get, model)
                         total_fields = len(all_fields_info)
                     except Exception:
                         pass
@@ -975,6 +1008,8 @@ class OdooToolHandler:
             raise
         except NotFoundError as e:
             raise ValidationError(str(e)) from e
+        except AccessControlUnavailableError as e:
+            raise ValidationError(f"Could not verify access (connection error): {e}") from e
         except AccessControlError as e:
             raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
@@ -993,14 +1028,12 @@ class OdooToolHandler:
                 if self.config.is_yolo_enabled:
                     # Query actual models from ir.model in YOLO mode
                     try:
-                        # Exclude transient models and less useful system models
+                        # Exclude transient models and system models (ir.%/base.%),
+                        # except a small whitelist of useful ir.* models.
                         domain = [
                             "&",
                             ("transient", "=", False),
                             "|",
-                            "|",
-                            ("model", "not like", "ir.%"),
-                            ("model", "not like", "base.%"),
                             (
                                 "model",
                                 "in",
@@ -1011,10 +1044,14 @@ class OdooToolHandler:
                                     "ir.config_parameter",
                                 ],
                             ),
+                            "&",
+                            ("model", "not like", "ir.%"),
+                            ("model", "not like", "base.%"),
                         ]
 
                         # Query models from database
-                        model_records = self.connection.search_read(
+                        model_records = await asyncio.to_thread(
+                            self.connection.search_read,
                             "ir.model",
                             domain,
                             ["model", "name"],
@@ -1089,7 +1126,7 @@ class OdooToolHandler:
                         }
 
                 # Standard mode: Get models from MCP access controller
-                models = self.access_controller.get_enabled_models()
+                models = await asyncio.to_thread(self.access_controller.get_enabled_models)
 
                 # Enrich with permissions for each model
                 if models:
@@ -1099,7 +1136,9 @@ class OdooToolHandler:
                     model_name = model_info["model"]
                     try:
                         # Get permissions for this model
-                        permissions = self.access_controller.get_model_permissions(model_name)
+                        permissions = await asyncio.to_thread(
+                            self.access_controller.get_model_permissions, model_name
+                        )
                         enriched_model = {
                             "model": model_name,
                             "name": model_info["name"],
@@ -1139,9 +1178,15 @@ class OdooToolHandler:
         """Handle list resource templates tool request."""
         try:
             await self._ctx_info(ctx, "Listing resource templates...")
-            # Get list of enabled models that can be used with resources
-            enabled_models = self.access_controller.get_enabled_models()
-            model_names = [m["model"] for m in enabled_models if m.get("read", True)]
+            # Get list of enabled models that can be used with resources.
+            # In YOLO mode get_enabled_models() returns [] as an
+            # "all models allowed" sentinel — report that explicitly
+            # instead of claiming zero models are usable.
+            if self.config.is_yolo_enabled:
+                model_names = None
+            else:
+                enabled_models = await asyncio.to_thread(self.access_controller.get_enabled_models)
+                model_names = [m["model"] for m in enabled_models]
 
             # Define the resource templates
             templates = [
@@ -1181,11 +1226,23 @@ class OdooToolHandler:
             ]
 
             # Return the resource template information
+            base_note = (
+                "Resource URIs do not support query parameters. Use tools "
+                "(search_records, get_record) for advanced operations with "
+                "filtering, pagination, and field selection."
+            )
+            if model_names is None:
+                return {
+                    "templates": templates,
+                    "enabled_models": [],
+                    "total_models": None,
+                    "note": f"YOLO mode: ALL models are available with these templates. {base_note}",
+                }
             return {
                 "templates": templates,
                 "enabled_models": model_names[:10],  # Show first 10 as examples
                 "total_models": len(model_names),
-                "note": "Resource URIs do not support query parameters. Use tools (search_records, get_record) for advanced operations with filtering, pagination, and field selection.",
+                "note": base_note,
             }
 
         except Exception as e:
@@ -1203,7 +1260,9 @@ class OdooToolHandler:
         try:
             with perf_logger.track_operation("tool_create_record", model=model):
                 # Check model access
-                self.access_controller.validate_model_access(model, "create")
+                await asyncio.to_thread(
+                    self.access_controller.validate_model_access, model, "create"
+                )
                 await self._ctx_info(ctx, f"Creating record in {model}...")
 
                 # Ensure we're connected
@@ -1215,7 +1274,7 @@ class OdooToolHandler:
                     raise ValidationError("No values provided for record creation")
 
                 # Create the record
-                record_id = self.connection.create(model, values)
+                record_id = await asyncio.to_thread(self.connection.create, model, values)
 
                 # Return only essential fields to minimize context usage
                 # Users can use get_record if they need more fields
@@ -1223,14 +1282,16 @@ class OdooToolHandler:
                 essential_fields = ["id", "display_name"]
 
                 # Read only the essential fields
-                records = self.connection.read(model, [record_id], essential_fields)
+                records = await asyncio.to_thread(
+                    self.connection.read, model, [record_id], essential_fields
+                )
                 if not records:
                     raise ValidationError(
                         f"Failed to read created record: {model} with ID {record_id}"
                     )
 
                 # Process dates in the minimal record
-                record = self._process_record_dates(records[0], model)
+                record = await asyncio.to_thread(self._process_record_dates, records[0], model)
 
                 record_url = self.connection.build_record_url(model, record_id)
 
@@ -1243,6 +1304,8 @@ class OdooToolHandler:
 
         except ValidationError:
             raise
+        except AccessControlUnavailableError as e:
+            raise ValidationError(f"Could not verify access (connection error): {e}") from e
         except AccessControlError as e:
             raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
@@ -1263,7 +1326,9 @@ class OdooToolHandler:
         try:
             with perf_logger.track_operation("tool_update_record", model=model):
                 # Check model access
-                self.access_controller.validate_model_access(model, "write")
+                await asyncio.to_thread(
+                    self.access_controller.validate_model_access, model, "write"
+                )
                 await self._ctx_info(ctx, f"Updating {model}/{record_id}...")
 
                 # Ensure we're connected
@@ -1275,12 +1340,12 @@ class OdooToolHandler:
                     raise ValidationError("No values provided for record update")
 
                 # Check if record exists (only fetch ID to verify existence)
-                existing = self.connection.read(model, [record_id], ["id"])
+                existing = await asyncio.to_thread(self.connection.read, model, [record_id], ["id"])
                 if not existing:
                     raise NotFoundError(f"Record not found: {model} with ID {record_id}")
 
                 # Update the record
-                success = self.connection.write(model, [record_id], values)
+                success = await asyncio.to_thread(self.connection.write, model, [record_id], values)
 
                 # Return only essential fields to minimize context usage
                 # Users can use get_record if they need more fields
@@ -1288,14 +1353,16 @@ class OdooToolHandler:
                 essential_fields = ["id", "display_name"]
 
                 # Read only the essential fields
-                records = self.connection.read(model, [record_id], essential_fields)
+                records = await asyncio.to_thread(
+                    self.connection.read, model, [record_id], essential_fields
+                )
                 if not records:
                     raise ValidationError(
                         f"Failed to read updated record: {model} with ID {record_id}"
                     )
 
                 # Process dates in the minimal record
-                record = self._process_record_dates(records[0], model)
+                record = await asyncio.to_thread(self._process_record_dates, records[0], model)
 
                 record_url = self.connection.build_record_url(model, record_id)
 
@@ -1310,6 +1377,8 @@ class OdooToolHandler:
             raise
         except NotFoundError as e:
             raise ValidationError(str(e)) from e
+        except AccessControlUnavailableError as e:
+            raise ValidationError(f"Could not verify access (connection error): {e}") from e
         except AccessControlError as e:
             raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
@@ -1329,7 +1398,9 @@ class OdooToolHandler:
         try:
             with perf_logger.track_operation("tool_delete_record", model=model):
                 # Check model access
-                self.access_controller.validate_model_access(model, "unlink")
+                await asyncio.to_thread(
+                    self.access_controller.validate_model_access, model, "unlink"
+                )
                 await self._ctx_info(ctx, f"Deleting {model}/{record_id}...")
 
                 # Ensure we're connected
@@ -1337,15 +1408,20 @@ class OdooToolHandler:
                     raise ValidationError("Not authenticated with Odoo")
 
                 # Check if record exists and get display info
-                existing = self.connection.read(model, [record_id], ["id", "display_name"])
+                existing = await asyncio.to_thread(
+                    self.connection.read, model, [record_id], ["id", "display_name"]
+                )
                 if not existing:
                     raise NotFoundError(f"Record not found: {model} with ID {record_id}")
 
-                # Store some info about the record before deletion
-                record_name = existing[0].get("display_name", f"ID {record_id}")
+                # Store some info about the record before deletion.
+                # Odoo returns False (not a missing key) for records without
+                # a display name (e.g. mail.message) — falling back via
+                # .get's default would leave False and break DeleteResult.
+                record_name = existing[0].get("display_name") or f"ID {record_id}"
 
                 # Delete the record
-                success = self.connection.unlink(model, [record_id])
+                success = await asyncio.to_thread(self.connection.unlink, model, [record_id])
 
                 return {
                     "success": success,
@@ -1358,6 +1434,8 @@ class OdooToolHandler:
             raise
         except NotFoundError as e:
             raise ValidationError(str(e)) from e
+        except AccessControlUnavailableError as e:
+            raise ValidationError(f"Could not verify access (connection error): {e}") from e
         except AccessControlError as e:
             raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
@@ -1387,7 +1465,9 @@ class OdooToolHandler:
         try:
             with perf_logger.track_operation("tool_post_message", model=model):
                 # Check model access — message_post mutates the record
-                self.access_controller.validate_model_access(model, "write")
+                await asyncio.to_thread(
+                    self.access_controller.validate_model_access, model, "write"
+                )
                 await self._ctx_info(ctx, f"Posting message to {model}/{record_id}...")
 
                 # Ensure we're connected
@@ -1416,7 +1496,9 @@ class OdooToolHandler:
                 # Call message_post; translate the "no mail.thread" error before
                 # the outer ladder turns it into a generic "Connection error".
                 try:
-                    raw = self.connection.execute_kw(model, "message_post", [record_id], kwargs)
+                    raw = await asyncio.to_thread(
+                        self.connection.execute_kw, model, "message_post", [record_id], kwargs
+                    )
                 except OdooConnectionError as e:
                     err_msg = str(e)
                     if "message_post" in err_msg and (
@@ -1447,6 +1529,8 @@ class OdooToolHandler:
 
         except ValidationError:
             raise
+        except AccessControlUnavailableError as e:
+            raise ValidationError(f"Could not verify access (connection error): {e}") from e
         except AccessControlError as e:
             raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
@@ -1549,7 +1633,7 @@ class OdooToolHandler:
         try:
             with perf_logger.track_operation("tool_aggregate_records", model=model):
                 # Access check (read permission — same as search_records)
-                self.access_controller.validate_model_access(model, "read")
+                await asyncio.to_thread(self.access_controller.validate_model_access, model, "read")
                 await self._ctx_info(ctx, f"Aggregating {model}...")
 
                 if not self.connection.is_authenticated:
@@ -1570,6 +1654,9 @@ class OdooToolHandler:
                 elif limit > self.config.max_limit:
                     limit = self.config.max_limit
 
+                if offset < 0:
+                    raise ValidationError(f"offset must be >= 0, got {offset}")
+
                 # Default to ['__count'] when caller omits aggregates —
                 # otherwise formatted_read_group returns only the groupby
                 # keys with no quantitative data, which defeats the tool.
@@ -1580,10 +1667,17 @@ class OdooToolHandler:
                 # older versions. When the version is unknown (None), assume
                 # newer and let the XML-RPC fault surface — the caller can
                 # set ODOO_DB or check the connection log.
-                major = self.connection.get_major_version()
+                major = await asyncio.to_thread(self.connection.get_major_version)
                 if major is not None and major < 19:
-                    groups = self._call_read_group_normalized(
-                        model, parsed_domain, groupby, effective_aggregates, order, limit, offset
+                    groups = await asyncio.to_thread(
+                        self._call_read_group_normalized,
+                        model,
+                        parsed_domain,
+                        groupby,
+                        effective_aggregates,
+                        order,
+                        limit,
+                        offset,
                     )
                 else:
                     kwargs: Dict[str, Any] = {
@@ -1594,8 +1688,12 @@ class OdooToolHandler:
                     }
                     if order is not None:
                         kwargs["order"] = order
-                    groups = self.connection.execute_kw(
-                        model, "formatted_read_group", [parsed_domain], kwargs
+                    groups = await asyncio.to_thread(
+                        self.connection.execute_kw,
+                        model,
+                        "formatted_read_group",
+                        [parsed_domain],
+                        kwargs,
                     )
 
                 await self._ctx_info(ctx, f"Returning {len(groups)} groups")
@@ -1609,6 +1707,8 @@ class OdooToolHandler:
 
         except ValidationError:
             raise
+        except AccessControlUnavailableError as e:
+            raise ValidationError(f"Could not verify access (connection error): {e}") from e
         except AccessControlError as e:
             raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:
@@ -1695,7 +1795,9 @@ class OdooToolHandler:
                     )
 
                 # No-op under full YOLO; placeholder if the gate ever loosens.
-                self.access_controller.validate_model_access(model, "write")
+                await asyncio.to_thread(
+                    self.access_controller.validate_model_access, model, "write"
+                )
                 await self._ctx_info(ctx, f"Calling {model}.{method}(...)")
 
                 if not self.connection.is_authenticated:
@@ -1713,10 +1815,9 @@ class OdooToolHandler:
                     sorted(kwargs_dict.keys()),
                 )
 
-                rpc_result = self.connection.execute_kw(model, method, args_list, kwargs_dict)
-
-                # Workflow methods mutate state; flush the model's cache.
-                self.connection.performance_manager.invalidate_record_cache(model)
+                rpc_result = await asyncio.to_thread(
+                    self.connection.execute_kw, model, method, args_list, kwargs_dict
+                )
 
                 return {
                     "success": True,
@@ -1726,6 +1827,8 @@ class OdooToolHandler:
 
         except ValidationError:
             raise
+        except AccessControlUnavailableError as e:
+            raise ValidationError(f"Could not verify access (connection error): {e}") from e
         except AccessControlError as e:
             raise ValidationError(f"Access denied: {e}") from e
         except OdooConnectionError as e:

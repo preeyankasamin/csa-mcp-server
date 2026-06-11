@@ -16,10 +16,7 @@ from mcp_server_odoo.error_handling import ValidationError
 from mcp_server_odoo.odoo_connection import OdooConnection
 from mcp_server_odoo.tools import OdooToolHandler
 
-from .conftest import ODOO_SERVER_AVAILABLE
 
-
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 @pytest.mark.yolo
 class TestYoloModeE2E:
     """End-to-end tests for YOLO mode with real Odoo."""
@@ -506,7 +503,6 @@ class TestYoloOptInValidation:
                 )
 
 
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 @pytest.mark.yolo
 class TestYoloAggregateRecordsE2E:
     """Live YOLO mode tests for the aggregate_records tool (Odoo 17+)."""

@@ -118,7 +118,9 @@ class ResourceTemplatesResult(BaseModel):
 
     templates: List[ResourceTemplateInfo] = Field(description="Available resource templates")
     enabled_models: List[str] = Field(description="Sample of models usable with these templates")
-    total_models: int = Field(description="Total number of enabled models")
+    total_models: Optional[int] = Field(
+        description="Total number of enabled models (None in YOLO mode: all models are available)"
+    )
     note: str = Field(description="Usage guidance for resources vs tools")
 
 

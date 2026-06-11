@@ -197,6 +197,28 @@ class TestWriteTools:
         mock_connection.read.assert_called_once_with(model, [record_id], ["id", "display_name"])
 
     @pytest.mark.asyncio
+    async def test_delete_record_without_display_name(self, tool_handler, mock_connection):
+        """Records without a display name (e.g. mail.message) return False —
+        the result must fall back to an ID label, not crash DeleteResult
+        validation AFTER the unlink already succeeded.
+
+        Found in manual testing: deleting a mail.message deleted the record
+        but returned a Pydantic error, leaving the client believing the
+        delete failed.
+        """
+        from mcp_server_odoo.schemas import DeleteResult
+
+        mock_connection.read.return_value = [{"id": 6115, "display_name": False}]
+        mock_connection.unlink.return_value = True
+
+        result = await tool_handler._handle_delete_record_tool("mail.message", 6115)
+
+        assert result["success"] is True
+        assert result["deleted_name"] == "ID 6115"
+        # The dict must validate against the declared result schema
+        DeleteResult(**result)
+
+    @pytest.mark.asyncio
     async def test_delete_record_not_found(self, tool_handler, mock_connection):
         """Test delete record that doesn't exist."""
         mock_connection.read.return_value = []
@@ -867,8 +889,7 @@ class TestPostMessageMCPIntegration:
         message_id = result["message_id"]
         assert isinstance(message_id, int) and message_id > 0
 
-        # Verification reads mail.message, which not every MCP deployment exposes.
-        # If it isn't enabled, treat the round-trip success as sufficient.
+        # Verification reads mail.message, which not every MCP deployment exposes
         try:
             messages = handler.connection.search_read(
                 "mail.message",
@@ -877,7 +898,7 @@ class TestPostMessageMCPIntegration:
             )
         except OdooConnectionError as e:
             if "Permission denied" in str(e) or "Access denied" in str(e):
-                return  # mail.message not exposed via MCP — post itself succeeded
+                pytest.skip("mail.message not exposed via MCP — post succeeded but unverifiable")
             raise
 
         try:
@@ -913,7 +934,9 @@ class TestPostMessageMCPIntegration:
                 None,
                 False,
             )
+            assert result["success"] is True
             message_id = result["message_id"]
+            assert isinstance(message_id, int) and message_id > 0
         except ValidationError as e:
             err = str(e)
             if "mail.thread" in err:
@@ -923,7 +946,7 @@ class TestPostMessageMCPIntegration:
             raise
 
         # Verification reads mail.message and ir.model.data, neither of which
-        # every MCP deployment exposes. Skip gracefully when they aren't.
+        # every MCP deployment exposes. Skip visibly when they aren't.
         try:
             messages = handler.connection.search_read(
                 "mail.message",
@@ -932,7 +955,7 @@ class TestPostMessageMCPIntegration:
             )
         except OdooConnectionError as e:
             if "Permission denied" in str(e) or "Access denied" in str(e):
-                return  # mail.message not exposed via MCP — post itself succeeded
+                pytest.skip("mail.message not exposed via MCP — subtype unverifiable")
             raise
 
         try:
@@ -951,7 +974,7 @@ class TestPostMessageMCPIntegration:
                 )
             except OdooConnectionError as e:
                 if "Permission denied" in str(e) or "Access denied" in str(e):
-                    return  # ir.model.data not exposed — leave subtype_id-level assertion only
+                    pytest.skip("ir.model.data not exposed via MCP — subtype name unverifiable")
                 raise
 
             assert any(
