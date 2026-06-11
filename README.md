@@ -259,6 +259,8 @@ docker run --rm -p 8000:8000 \
   ivnvxd/mcp-server-odoo --transport streamable-http --host 0.0.0.0
 ```
 
+> ⚠️ **Security**: the HTTP transport has no built-in authentication — anyone who can reach the port gets Odoo access through the server's credentials. Publish the port only on trusted networks, or front it with an authenticating reverse proxy. See [Transport Options](#transport-options).
+
 The image is also available on GHCR: `ghcr.io/ivnvxd/mcp-server-odoo`
 </details>
 
@@ -341,8 +343,13 @@ uvx mcp-server-odoo
 #### 2. **streamable-http**
 Standard HTTP transport for REST API-style access and remote connectivity.
 
+> ⚠️ **Security**: this transport has **no built-in client authentication**. Any client that can reach the port can use every tool and resource with the Odoo credentials the server holds — including writes in YOLO full-access mode. Keep the default `localhost` bind unless the network is trusted, and front the server with an authenticating reverse proxy (e.g. nginx with basic auth or OAuth) for remote access. The server logs a warning when binding a non-loopback host.
+
 ```bash
-# Run with HTTP transport
+# Run with HTTP transport (localhost only — safe default)
+uvx mcp-server-odoo --transport streamable-http --port 8000
+
+# Binding 0.0.0.0 exposes the server to the network — see the security note above
 uvx mcp-server-odoo --transport streamable-http --host 0.0.0.0 --port 8000
 
 # Or use environment variables
@@ -519,6 +526,7 @@ Search for records in any Odoo model with filters.
 **Field Selection Options:**
 - Omit `fields` or set to `null`: Returns smart selection of common fields
 - Specify field list: Returns only those specific fields
+- An empty list `[]` is treated like `null` (smart defaults)
 - Use `["__all__"]`: Returns all fields (use with caution)
 
 ### `get_record`
@@ -535,6 +543,7 @@ Retrieve a specific record by ID.
 **Field Selection Options:**
 - Omit `fields` or set to `null`: Returns smart selection of common fields with metadata
 - Specify field list: Returns only those specific fields
+- An empty list `[]` is treated like `null` (smart defaults)
 - Use `["__all__"]`: Returns all fields without metadata
 
 ### `list_models`
