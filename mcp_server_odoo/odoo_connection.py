@@ -477,7 +477,7 @@ class OdooConnection:
                 databases = self.db_proxy.list()
             logger.info(f"Found {len(databases)} databases")
             logger.debug(f"Database names: {databases}")
-            return databases  # type: ignore[invalid-return-type]  # XML-RPC proxy is untyped
+            return databases  # ty: ignore[invalid-return-type]  # XML-RPC proxy is untyped
         except xmlrpc.client.Fault as e:
             if self.config.is_yolo_enabled and "Access Denied" in str(e):
                 # Common error when database listing is restricted
@@ -639,7 +639,7 @@ class OdooConnection:
                 )
 
             if uid:
-                self._uid = uid  # type: ignore[invalid-assignment]  # XML-RPC proxy is untyped
+                self._uid = uid  # ty: ignore[invalid-assignment]  # XML-RPC proxy is untyped
                 self._database = database
                 self._auth_method = "api_key"
                 self._authenticated = True
@@ -769,7 +769,7 @@ class OdooConnection:
                 )
 
             if uid:
-                self._uid = uid  # type: ignore[invalid-assignment]  # XML-RPC proxy is untyped
+                self._uid = uid  # ty: ignore[invalid-assignment]  # XML-RPC proxy is untyped
                 self._database = database
                 self._auth_method = "password"
                 self._authenticated = True
@@ -1190,7 +1190,7 @@ class OdooConnection:
 
         try:
             with self._common_proxy_lock:
-                return self.common_proxy.version()  # type: ignore[invalid-return-type]  # XML-RPC proxy is untyped
+                return self.common_proxy.version()  # ty: ignore[invalid-return-type]  # XML-RPC proxy is untyped
         except Exception as e:
             logger.error(f"Failed to get server version: {e}")
             return None

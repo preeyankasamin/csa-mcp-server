@@ -28,7 +28,7 @@ class StructuredFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         """Format log record as JSON."""
         # Base log data
-        log_data = {
+        log_data: Dict[str, Any] = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "logger": record.name,
             "level": record.levelname,
@@ -235,7 +235,7 @@ def log_request(
         params: Query parameters
         body: Request body
     """
-    log_data = {
+    log_data: Dict[str, Any] = {
         "request_method": method,
         "request_path": path,
     }
