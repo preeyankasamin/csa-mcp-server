@@ -92,10 +92,12 @@ class CSAToolHandler:
         # Search mrp.bom where the product template name matches input
         # ilike = case-insensitive contains search
         with perf_logger.track_operation("bom_search", model="mrp.bom"):
-            bom_records = self.connection.execute_kw(
+           bom_records = self.connection.execute_kw(
                 "mrp.bom",
                 "search_read",
-                [[["product_tmpl_id.name", "ilike", product_name]]],
+                [["|",
+                  ["product_tmpl_id.name", "ilike", product_name],
+                  ["product_tmpl_id.default_code", "ilike", product_name]]],
                 {
                     "fields": [
                         "product_tmpl_id",   # finished product name + id

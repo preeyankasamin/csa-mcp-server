@@ -168,3 +168,63 @@ async def test_shortage_count_is_correct(csa_handler):
     expected_count = sum(1 for c in result["components"] if c["shortage"])
     assert result["shortage_count"] == expected_count, \
         f"shortage_count={result['shortage_count']} but actual={expected_count}"
+        
+        
+@pytest.mark.asyncio
+async def test_search_by_internal_reference(csa_handler):
+    """
+    User types internal reference code 'SMH-150D' not the full name.
+    Tool must find BOM via default_code field, not just product name.
+    This was a real bug found during Day 5 testing.
+    """
+    result = await csa_handler._handle_get_bom_with_stock("SMH-150D")
+
+    assert result["found"] is True, "SMH-150D should be found by internal reference"
+    assert result["total_components"] == 83, \
+        f"SMH-150D should have 83 components, got {result['total_components']}"
+
+
+@pytest.mark.asyncio
+async def test_large_bom_has_correct_shortage_count(csa_handler):
+    """
+    SMH-150D has 83 components — tests tool handles large BOMs correctly.
+    shortage_count must exactly match components with shortage=True.
+    """
+    result = await csa_handler._handle_get_bom_with_stock("SMH-150D")
+
+    assert result["found"] is True
+    actual_shortage_count = sum(1 for c in result["components"] if c["shortage"])
+    assert result["shortage_count"] == actual_shortage_count, \
+        f"shortage_count mismatch on large BOM"
+
+
+@pytest.mark.asyncio
+async def test_b1300_has_known_shortage(csa_handler):
+    """
+    B-1300 is confirmed to have DISPFAS-B1300 (Dispatch Fasteners) as shortage.
+    This test pins that known real-world data point.
+    If this fails, either Odoo data changed or tool logic broke.
+    """
+    result = await csa_handler._handle_get_bom_with_stock("B-1300")
+
+    assert result["found"] is True
+    shortage_products = [
+        c["product_name"] for c in result["components"] if c["shortage"]
+    ]
+    assert any("DISPFAS" in name for name in shortage_products), \
+        f"Expected DISPFAS-B1300 shortage, got shortages: {shortage_products}"
+
+
+@pytest.mark.asyncio
+async def test_qty_available_never_negative(csa_handler):
+    """
+    qty_available must never be negative in the result.
+    Our tool sums only positive stock quantities — negative subcontracting
+    stock must be excluded. Confirmed real issue from stock.quant audit.
+    """
+    result = await csa_handler._handle_get_bom_with_stock("SMH-150D")
+
+    assert result["found"] is True
+    for c in result["components"]:
+        assert c["qty_available"] >= 0, \
+            f"qty_available is negative for {c['product_name']}: {c['qty_available']}"
