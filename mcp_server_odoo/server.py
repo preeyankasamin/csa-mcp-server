@@ -24,6 +24,7 @@ from .odoo_connection import OdooConnection, OdooConnectionError
 from .performance import PerformanceManager
 from .resources import register_resources
 from .tools import register_tools
+from .csa_tools import CSAToolHandler
 
 # Set up logging
 logger = get_logger(__name__)
@@ -251,6 +252,9 @@ class OdooMCPServer:
                 self.app, self.connection, self.access_controller, self.config
             )
             logger.info("Registered MCP tools")
+            # Register CSA Aerotherm custom tools
+            self.csa_tool_handler = CSAToolHandler(self.app, self.connection)
+            logger.info("Registered CSA custom tools")
 
     async def run_stdio(self):
         """Run the server using stdio transport."""
