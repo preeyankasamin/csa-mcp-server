@@ -128,3 +128,8 @@ docs/
 *.scss.map
 
 .mcp.json
+
+
+# CSA logs
+logs/
+!logs/.gitkeep
