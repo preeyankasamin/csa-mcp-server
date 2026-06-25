@@ -491,3 +491,80 @@ class CSAToolHandler:
             "total_unique_raw_materials": len(raw_materials),
             "raw_materials": raw_materials,
         }
+    def _check_stock_for_product(self, product_id: int) -> float:
+        """
+        Returns the available stock qty for a product in WH/CSAPL Stock.
+
+        product_id -- numeric Odoo ID of the product
+        """
+        quant_records = self.connection.execute_kw(
+            "stock.quant",
+            "search_read",
+            [[
+                ["product_id", "=", product_id],
+                ["location_id.complete_name", "ilike", CSA_STOCK_LOCATION],
+                ["location_id.usage", "=", "internal"],
+            ]],
+            {"fields": ["quantity"]},
+        )
+        return sum(q["quantity"] for q in quant_records if q["quantity"] > 0)
+
+    def get_shortage_report(
+        self,
+        product_name: str,
+        qty: float = 1.0,
+    ):
+        """
+        Full multi-level shortage report for a product.
+        Explodes the BOM completely, checks stock for every raw material,
+        returns only the items that are short.
+
+        product_name -- full or partial name or internal reference
+        qty          -- how many finished units you want to build (default 1)
+        """
+        logger.info(
+            f"get_shortage_report called: product='{product_name}' qty={qty}"
+        )
+
+        # Step 1: Explode the BOM fully
+        explosion = self.explode_bom_multilevel(product_name, qty)
+
+        if not explosion["found"]:
+            return {
+                "found": False,
+                "product_name": product_name,
+                "message": explosion["message"],
+                "shortages": [],
+            }
+
+        # Step 2: Check stock for each raw material
+        shortages = []
+        for item in explosion["raw_materials"]:
+            qty_available = self._check_stock_for_product(item["product_id"])
+            qty_needed = item["qty_needed"]
+
+            if qty_available < qty_needed:
+                shortages.append({
+                    "product_id": item["product_id"],
+                    "product_name": item["product_name"],
+                    "qty_needed": round(qty_needed, 2),
+                    "qty_available": round(qty_available, 2),
+                    "shortage_qty": round(qty_needed - qty_available, 2),
+                    "uom": item["uom"],
+                })
+
+        logger.info(
+            f"get_shortage_report complete: '{explosion['finished_product']}' "
+            f"qty={qty} -> {len(shortages)} shortages out of "
+            f"{explosion['total_unique_raw_materials']} raw materials"
+        )
+
+        return {
+            "found": True,
+            "finished_product": explosion["finished_product"],
+            "qty_requested": qty,
+            "total_raw_materials": explosion["total_unique_raw_materials"],
+            "shortage_count": len(shortages),
+            "has_shortages": len(shortages) > 0,
+            "shortages": shortages,
+        }
