@@ -224,3 +224,270 @@ class CSAToolHandler:
         )
 
         return result
+
+# ── Multi-level BOM explosion ──────────────────────────────────────────
+
+    def _get_bom_for_product_id(self, product_id: int):
+        """
+        Given a product.product ID, find its BOM if one exists.
+        Returns the BOM record or None.
+
+        product_id  — the numeric Odoo ID of the product
+        """
+        # First get the product_tmpl_id from product.product
+        # because mrp.bom links to product.template, not product.product
+        product_records = self.connection.execute_kw(
+            "product.product",
+            "read",
+            [[product_id]],
+            {"fields": ["product_tmpl_id"]},
+        )
+        if not product_records:
+            return None
+
+        tmpl_id = product_records[0]["product_tmpl_id"][0]
+
+        # Now search mrp.bom for this template
+        bom_records = self.connection.execute_kw(
+            "mrp.bom",
+            "search_read",
+            [[["product_tmpl_id", "=", tmpl_id]]],
+            {
+                "fields": [
+                    "id",
+                    "product_qty",
+                    "bom_line_ids",
+                ],
+                "limit": 1,
+            },
+        )
+        if not bom_records:
+            return None
+
+        return bom_records[0]
+
+    def _explode(
+        self,
+        product_id: int,
+        product_name: str,
+        qty_needed: float,
+        uom: str,
+        visited: set,
+        depth: int = 0,
+    ):
+        """
+        Recursively breaks down a product into its raw materials.
+        Returns a list of raw material dicts.
+
+        product_id   — numeric Odoo ID of the product to break down
+        product_name — display name (used for logging only)
+        qty_needed   — how many units of this product we need
+        uom          — unit of measure string
+        visited      — set of product_ids already processed (circular BOM guard)
+        depth        — how deep we are (0=top level, 1=sub-assembly, etc)
+        """
+
+        # ── Circular BOM guard ──────────────────────────────────────────
+        # If we have already visited this product, stop immediately
+        # This prevents infinite loops if Odoo has A→B→A by mistake
+        if product_id in visited:
+            logger.warning(
+                f"Circular BOM detected for product_id={product_id} "
+                f"'{product_name}' at depth={depth}. Stopping recursion."
+            )
+            return [{
+                "product_id": product_id,
+                "product_name": product_name,
+                "qty_needed": qty_needed,
+                "uom": uom,
+                "depth": depth,
+                "note": "circular_bom_detected",
+            }]
+
+        # Mark this product as visited
+        visited.add(product_id)
+
+        # ── Check if this product has a BOM ────────────────────────────
+        bom = self._get_bom_for_product_id(product_id)
+
+        if bom is None:
+            # No BOM = this is a raw material = add to final list
+            logger.debug(
+                f"{'  ' * depth}RAW: '{product_name}' qty={qty_needed} {uom}"
+            )
+            return [{
+                "product_id": product_id,
+                "product_name": product_name,
+                "qty_needed": round(qty_needed, 4),
+                "uom": uom,
+                "depth": depth,
+            }]
+
+        # ── Has a BOM = fetch its component lines ──────────────────────
+        bom_produces_qty = bom["product_qty"]
+        # Scale factor: if BOM produces 2 units but we need 6,
+        # we need 3x all quantities
+        scale = qty_needed / bom_produces_qty
+
+        bom_lines = self.connection.execute_kw(
+            "mrp.bom.line",
+            "search_read",
+            [[["bom_id", "=", bom["id"]]]],
+            {
+                "fields": [
+                    "product_id",
+                    "product_qty",
+                    "product_uom_id",
+                ]
+            },
+        )
+
+        logger.debug(
+            f"{'  ' * depth}ASSEMBLY: '{product_name}' "
+            f"qty={qty_needed} → {len(bom_lines)} components"
+        )
+
+        # ── Recurse into each component ────────────────────────────────
+        raw_materials = []
+        for line in bom_lines:
+            comp_id = line["product_id"][0]
+            comp_name = line["product_id"][1]
+            comp_qty = line["product_qty"] * scale
+            comp_uom = line["product_uom_id"][1]
+
+            # Recurse — go one level deeper
+            result = self._explode(
+                product_id=comp_id,
+                product_name=comp_name,
+                qty_needed=comp_qty,
+                uom=comp_uom,
+                visited=visited,
+                depth=depth + 1,
+            )
+            raw_materials.extend(result)
+
+        return raw_materials
+
+    def explode_bom_multilevel(
+        self,
+        product_name: str,
+        qty: float = 1.0,
+    ):
+        """
+        Entry point for multi-level BOM explosion.
+        Takes a product name and quantity, returns full raw material list.
+
+        product_name — full or partial name or internal reference
+        qty          — how many finished units you want to build (default 1)
+        """
+
+        logger.info(
+            f"explode_bom_multilevel called: product='{product_name}' qty={qty}"
+        )
+
+        # Step 1: Find the top-level BOM by name (same search as get_bom_with_stock)
+        bom_records = self.connection.execute_kw(
+            "mrp.bom",
+            "search_read",
+            [["|",
+              ["product_tmpl_id.name", "ilike", product_name],
+              ["product_tmpl_id.default_code", "ilike", product_name]]],
+            {
+                "fields": [
+                    "id",
+                    "product_tmpl_id",
+                    "product_qty",
+                    "product_uom_id",
+                    "bom_line_ids",
+                ],
+                "limit": 1,
+            },
+        )
+
+        if not bom_records:
+            return {
+                "found": False,
+                "product_name": product_name,
+                "message": f"No BOM found for '{product_name}'.",
+                "raw_materials": [],
+            }
+
+        bom = bom_records[0]
+        finished_product = bom["product_tmpl_id"][1]
+        bom_produces_qty = bom["product_qty"]
+        uom = bom["product_uom_id"][1]
+
+        # Get the product.product ID for the finished product
+        tmpl_id = bom["product_tmpl_id"][0]
+        product_variants = self.connection.execute_kw(
+            "product.product",
+            "search_read",
+            [[["product_tmpl_id", "=", tmpl_id]]],
+            {"fields": ["id"], "limit": 1},
+        )
+        if not product_variants:
+            return {
+                "found": False,
+                "product_name": product_name,
+                "message": f"Product template found but no variant exists.",
+                "raw_materials": [],
+            }
+
+        top_product_id = product_variants[0]["id"]
+
+        # Step 2: Explode — pass empty visited set (fresh start)
+        scale = qty / bom_produces_qty
+        raw_materials_nested = []
+
+        bom_lines = self.connection.execute_kw(
+            "mrp.bom.line",
+            "search_read",
+            [[["bom_id", "=", bom["id"]]]],
+            {"fields": ["product_id", "product_qty", "product_uom_id"]},
+        )
+
+        visited = {top_product_id}  # mark top product as visited immediately
+
+        for line in bom_lines:
+            comp_id = line["product_id"][0]
+            comp_name = line["product_id"][1]
+            comp_qty = line["product_qty"] * scale
+            comp_uom = line["product_uom_id"][1]
+
+            result = self._explode(
+                product_id=comp_id,
+                product_name=comp_name,
+                qty_needed=comp_qty,
+                uom=comp_uom,
+                visited=visited,
+                depth=1,
+            )
+            raw_materials_nested.extend(result)
+
+        # Step 3: Merge duplicates
+        # Same product may appear via multiple paths — combine their quantities
+        merged = {}
+        for item in raw_materials_nested:
+            pid = item["product_id"]
+            if pid in merged:
+                merged[pid]["qty_needed"] = round(
+                    merged[pid]["qty_needed"] + item["qty_needed"], 4
+                )
+            else:
+                merged[pid] = item.copy()
+
+        raw_materials = list(merged.values())
+
+        logger.info(
+            f"explode_bom_multilevel complete: '{finished_product}' "
+            f"qty={qty} → {len(raw_materials)} unique raw materials"
+        )
+
+        return {
+            "found": True,
+            "finished_product": finished_product,
+            "qty_requested": qty,
+            "uom": uom,
+            "total_unique_raw_materials": len(raw_materials),
+            "raw_materials": raw_materials,
+        }
