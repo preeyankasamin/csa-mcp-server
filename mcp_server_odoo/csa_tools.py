@@ -6,12 +6,16 @@ the original mcp-server-odoo repo code.
 """
 
 import xmlrpc.client
+import socket
 from typing import Any, Dict, List, Optional
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
 from .logging_config import get_logger, perf_logger
+# Default timeout in seconds for all Odoo XML-RPC calls
+# If Odoo does not respond within this time, raise a clean error
+ODOO_XMLRPC_TIMEOUT = 30
 from .odoo_connection import OdooConnection
 
 # Creates a logger named 'mcp_server_odoo.csa_tools'
@@ -37,6 +41,7 @@ class CSAToolHandler:
         self.app = app
         self.connection = connection
         self._register_csa_tools()
+        socket.setdefaulttimeout(ODOO_XMLRPC_TIMEOUT)
 
     def _register_csa_tools(self):
         """Registers all CSA tools into the FastMCP app."""
@@ -567,4 +572,146 @@ class CSAToolHandler:
             "shortage_count": len(shortages),
             "has_shortages": len(shortages) > 0,
             "shortages": shortages,
+        }
+
+    def _get_vendor_info_for_product(self, product_id: int, qty_needed: float):
+        """
+        Fetches all vendors for a component from product.supplierinfo.
+        Returns list of vendors with price, min_qty, lead_time,
+        and a recommended_vendor picked by lowest price where min_qty is meetable.
+
+        product_id  -- numeric Odoo product.product ID
+        qty_needed  -- how many units we need (used to filter meetable min_qty)
+        """
+        # product.supplierinfo links to product.template, not product.product
+        # so first get the template ID
+        product_records = self.connection.execute_kw(
+            "product.product",
+            "read",
+            [[product_id]],
+            {"fields": ["product_tmpl_id", "display_name"]},
+        )
+        if not product_records:
+            return [], None
+
+        tmpl_id = product_records[0]["product_tmpl_id"][0]
+        product_display_name = product_records[0]["display_name"]
+
+        # Now fetch all vendor pricelists for this product template
+        supplier_records = self.connection.execute_kw(
+            "product.supplierinfo",
+            "search_read",
+            [[["product_tmpl_id", "=", tmpl_id]]],
+            {
+                "fields": [
+                    "partner_id",    # vendor name + id
+                    "price",         # unit price
+                    "min_qty",       # minimum order quantity
+                    "delay",         # lead time in days
+                    "currency_id",   # currency (INR etc)
+                ],
+            },
+        )
+
+        if not supplier_records:
+            return [], None
+
+        # Build clean vendor list
+        vendors = []
+        for s in supplier_records:
+            vendors.append({
+                "vendor_name": s["partner_id"][1],
+                "vendor_id": s["partner_id"][0],
+                "price": s["price"],
+                "min_qty": s["min_qty"],
+                "lead_time_days": s["delay"],
+                "currency": s["currency_id"][1] if s["currency_id"] else "INR",
+            })
+
+        # Pick recommended vendor:
+        # 1. Filter to vendors whose min_qty we can meet
+        # 2. Among those, pick lowest price
+        # 3. If tie on price, pick shortest lead time
+        meetable = [v for v in vendors if v["min_qty"] <= qty_needed]
+
+        if meetable:
+            recommended = min(
+                meetable,
+                key=lambda v: (v["price"], v["lead_time_days"])
+            )
+        else:
+            # No vendor meets our min_qty requirement
+            # Still recommend the cheapest overall so team knows who to negotiate with
+            recommended = min(
+                vendors,
+                key=lambda v: (v["price"], v["lead_time_days"])
+            )
+
+        return vendors, recommended["vendor_name"]
+
+    def get_vendor_lead_times(
+        self,
+        product_name: str,
+        qty: float = 1.0,
+    ):
+        """
+        For a finished product, explodes the full BOM and returns
+        all vendors + lead times for every raw material component.
+        Flags components that have no vendor configured in Odoo.
+
+        product_name -- full or partial name or internal reference
+        qty          -- how many finished units you want to build (default 1)
+        """
+        logger.info(
+            f"get_vendor_lead_times called: product='{product_name}' qty={qty}"
+        )
+
+        # Step 1: Explode the BOM to get all raw materials
+        explosion = self.explode_bom_multilevel(product_name, qty)
+
+        if not explosion["found"]:
+            return {
+                "found": False,
+                "product_name": product_name,
+                "message": explosion["message"],
+                "components": [],
+            }
+
+        # Step 2: For each raw material, fetch vendor info
+        components = []
+        no_vendor_count = 0
+
+        for item in explosion["raw_materials"]:
+            vendors, recommended = self._get_vendor_info_for_product(
+                item["product_id"],
+                item["qty_needed"],
+            )
+
+            has_vendor = len(vendors) > 0
+            if not has_vendor:
+                no_vendor_count += 1
+
+            components.append({
+                "product_id": item["product_id"],
+                "product_name": item["product_name"],
+                "qty_needed": item["qty_needed"],
+                "uom": item["uom"],
+                "has_vendor": has_vendor,
+                "recommended_vendor": recommended,
+                "vendors": vendors,
+            })
+
+        logger.info(
+            f"get_vendor_lead_times complete: '{explosion['finished_product']}' "
+            f"qty={qty} -> {len(components)} components, "
+            f"{no_vendor_count} missing vendors"
+        )
+
+        return {
+            "found": True,
+            "finished_product": explosion["finished_product"],
+            "qty_requested": qty,
+            "total_components": len(components),
+            "no_vendor_count": no_vendor_count,
+            "components": components,
         }
