@@ -8,6 +8,7 @@ the original mcp-server-odoo repo code.
 import xmlrpc.client
 import socket
 from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, field_validator
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
@@ -26,6 +27,61 @@ logger = get_logger(__name__)
 # Confirmed from stock.quant query: location_id = [8, 'WH/CSAPL Stock']
 CSA_STOCK_LOCATION = "WH/CSAPL Stock"
 
+class BomInput(BaseModel):
+    product_name: str
+    qty: float = 1.0
+
+    @field_validator("product_name")
+    @classmethod
+    def name_must_not_be_empty(cls, v):
+        if not v.strip():
+            raise ValueError("product_name cannot be empty")
+        return v.strip()
+
+    @field_validator("qty")
+    @classmethod
+    def qty_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError("qty must be greater than 0")
+        return v  #v — the actual value passed in by Claude
+
+
+class ShortageInput(BaseModel):
+    product_name: str
+    qty: float = 1.0
+
+    @field_validator("product_name")
+    @classmethod
+    def name_must_not_be_empty(cls, v):
+        if not v.strip():  #v.strip() — removes spaces from both ends of the string
+            raise ValueError("product_name cannot be empty")
+        return v.strip()
+
+    @field_validator("qty")
+    @classmethod
+    def qty_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError("qty must be greater than 0")
+        return v
+
+
+class VendorInput(BaseModel):
+    product_name: str
+    qty: float = 1.0
+
+    @field_validator("product_name")
+    @classmethod
+    def name_must_not_be_empty(cls, v):
+        if not v.strip():
+            raise ValueError("product_name cannot be empty")
+        return v.strip()
+
+    @field_validator("qty")
+    @classmethod
+    def qty_must_be_positive(cls, v):
+        if v <= 0:
+            raise ValueError("qty must be greater than 0")
+        return v
 
 class CSAToolHandler:
     """
@@ -90,145 +146,161 @@ class CSAToolHandler:
         Core logic for get_bom_with_stock.
         Separated from the tool decorator to make it independently testable.
         """
+        try:
+            params = BomInput(product_name=product_name, qty=1.0)
+            product_name = params.product_name
+        except ValueError as e:
+            return {"error": str(e)}
 
         logger.info(f"get_bom_with_stock called for product: '{product_name}'")
+        try:
 
-        # ── Step 1: Find the BOM for this product ─────────────────────────────
-        # Search mrp.bom where the product template name matches input
-        # ilike = case-insensitive contains search
-        with perf_logger.track_operation("bom_search", model="mrp.bom"):
-           bom_records = self.connection.execute_kw(
-                "mrp.bom",
-                "search_read",
-                [["|",
-                  ["product_tmpl_id.name", "ilike", product_name],
-                  ["product_tmpl_id.default_code", "ilike", product_name]]],
-                {
-                    "fields": [
-                        "product_tmpl_id",   # finished product name + id
-                        "product_qty",        # how many units this BOM produces
-                        "product_uom_id",     # unit of measure (Nos, Kg, etc)
-                        "bom_line_ids",       # list of component line IDs
-                    ],
-                    "limit": 5,
-                },
-            )
+            # ── Step 1: Find the BOM for this product ─────────────────────────────
+            # Search mrp.bom where the product template name matches input
+            # ilike = case-insensitive contains search
+            with perf_logger.track_operation("bom_search", model="mrp.bom"):
+               bom_records = self.connection.execute_kw(
+                    "mrp.bom",
+                    "search_read",
+                    [["|",
+                      ["product_tmpl_id.name", "ilike", product_name],
+                      ["product_tmpl_id.default_code", "ilike", product_name]]],
+                    {
+                        "fields": [
+                            "product_tmpl_id",   # finished product name + id
+                            "product_qty",        # how many units this BOM produces
+                            "product_uom_id",     # unit of measure (Nos, Kg, etc)
+                            "bom_line_ids",       # list of component line IDs
+                        ],
+                        "limit": 5,
+                    },
+                )
 
-        # If no BOM found, return a clear message
-        if not bom_records:
-            logger.warning(f"No BOM found for product: '{product_name}'")
-            return {
-                "found": False,
-                "product_name": product_name,
-                "message": f"No Bill of Materials found for '{product_name}'. "
-                           f"Check the product name or internal reference.",
-                "components": [],
-            }
+            # If no BOM found, return a clear message
+            if not bom_records:
+                logger.warning(f"No BOM found for product: '{product_name}'")
+                return {
+                    "found": False,
+                    "product_name": product_name,
+                    "message": f"No Bill of Materials found for '{product_name}'. "
+                               f"Check the product name or internal reference.",
+                    "components": [],
+                }
 
-        # Take the first matching BOM
-        bom = bom_records[0]
-        bom_id = bom["id"]
-        finished_product = bom["product_tmpl_id"][1]  # [0]=id, [1]=name
-        produces_qty = bom["product_qty"]
-        uom = bom["product_uom_id"][1]
+            # Take the first matching BOM
+            bom = bom_records[0]
+            bom_id = bom["id"]
+            finished_product = bom["product_tmpl_id"][1]  # [0]=id, [1]=name
+            produces_qty = bom["product_qty"]
+            uom = bom["product_uom_id"][1]
 
-        logger.info(f"Found BOM id={bom_id} for '{finished_product}'")
+            logger.info(f"Found BOM id={bom_id} for '{finished_product}'")
 
-        # ── Step 2: Get all component lines ───────────────────────────────────
-        with perf_logger.track_operation("bom_lines_fetch", model="mrp.bom.line"):
-            bom_lines = self.connection.execute_kw(
-                "mrp.bom.line",
-                "search_read",
-                [[["bom_id", "=", bom_id]]],
-                {
-                    "fields": [
-                        "product_id",       # component product id + name
-                        "product_qty",      # quantity needed
-                        "product_uom_id",   # unit of measure
-                    ]
-                },
-            )
+            # ── Step 2: Get all component lines ───────────────────────────────────
+            with perf_logger.track_operation("bom_lines_fetch", model="mrp.bom.line"):
+                bom_lines = self.connection.execute_kw(
+                    "mrp.bom.line",
+                    "search_read",
+                    [[["bom_id", "=", bom_id]]],
+                    {
+                        "fields": [
+                            "product_id",       # component product id + name
+                            "product_qty",      # quantity needed
+                            "product_uom_id",   # unit of measure
+                        ]
+                    },
+                )
 
-        if not bom_lines:
-            return {
+            if not bom_lines:
+                return {
+                    "found": True,
+                    "bom_id": bom_id,
+                    "finished_product": finished_product,
+                    "produces_qty": produces_qty,
+                    "uom": uom,
+                    "message": "BOM exists but has no component lines.",
+                    "components": [],
+                    "has_shortages": False,
+                }
+
+            # ── Step 3: Check stock for each component ────────────────────────────
+            components = []
+            has_shortages = False
+
+            for line in bom_lines:
+                product_id = line["product_id"][0]    # numeric ID
+                product_name_full = line["product_id"][1]  # display name
+                qty_needed = line["product_qty"]
+                comp_uom = line["product_uom_id"][1]
+
+                # Query stock.quant for this product in CSA warehouse only
+                with perf_logger.track_operation("stock_check", model="stock.quant"):
+                    quant_records = self.connection.execute_kw(
+                        "stock.quant",
+                        "search_read",
+                        [[
+                            ["product_id", "=", product_id],
+                            ["location_id.complete_name", "ilike", CSA_STOCK_LOCATION],
+                            ["location_id.usage", "=", "internal"],
+                        ]],
+                        {"fields": ["quantity", "location_id"]},
+                    )
+
+                # Sum all quantities across matching locations
+                # (product may be in multiple bins within the warehouse)
+                qty_available = sum(
+                    q["quantity"] for q in quant_records if q["quantity"] > 0
+                )
+
+                shortage = qty_available < qty_needed
+
+                if shortage:
+                    has_shortages = True
+
+                components.append({
+                    "product_id": product_id,
+                    "product_name": product_name_full,
+                    "qty_needed": qty_needed,
+                    "qty_available": round(qty_available, 2),
+                    "uom": comp_uom,
+                    "shortage": shortage,
+                    "shortage_qty": round(max(0, qty_needed - qty_available), 2),
+                })
+
+                logger.debug(
+                    f"Component '{product_name_full}': "
+                    f"need={qty_needed}, have={qty_available}, shortage={shortage}"
+                )
+
+            # ── Step 4: Return complete result ────────────────────────────────────
+            result = {
                 "found": True,
                 "bom_id": bom_id,
                 "finished_product": finished_product,
                 "produces_qty": produces_qty,
                 "uom": uom,
-                "message": "BOM exists but has no component lines.",
-                "components": [],
-                "has_shortages": False,
+                "total_components": len(components),
+                "has_shortages": has_shortages,
+                "shortage_count": sum(1 for c in components if c["shortage"]),
+                "components": components,
             }
 
-        # ── Step 3: Check stock for each component ────────────────────────────
-        components = []
-        has_shortages = False
-
-        for line in bom_lines:
-            product_id = line["product_id"][0]    # numeric ID
-            product_name_full = line["product_id"][1]  # display name
-            qty_needed = line["product_qty"]
-            comp_uom = line["product_uom_id"][1]
-
-            # Query stock.quant for this product in CSA warehouse only
-            with perf_logger.track_operation("stock_check", model="stock.quant"):
-                quant_records = self.connection.execute_kw(
-                    "stock.quant",
-                    "search_read",
-                    [[
-                        ["product_id", "=", product_id],
-                        ["location_id.complete_name", "ilike", CSA_STOCK_LOCATION],
-                        ["location_id.usage", "=", "internal"],
-                    ]],
-                    {"fields": ["quantity", "location_id"]},
-                )
-
-            # Sum all quantities across matching locations
-            # (product may be in multiple bins within the warehouse)
-            qty_available = sum(
-                q["quantity"] for q in quant_records if q["quantity"] > 0
+            logger.info(
+                f"get_bom_with_stock complete: {len(components)} components, "
+                f"shortages={has_shortages}"
             )
 
-            shortage = qty_available < qty_needed
+            return result
 
-            if shortage:
-                has_shortages = True
-
-            components.append({
-                "product_id": product_id,
-                "product_name": product_name_full,
-                "qty_needed": qty_needed,
-                "qty_available": round(qty_available, 2),
-                "uom": comp_uom,
-                "shortage": shortage,
-                "shortage_qty": round(max(0, qty_needed - qty_available), 2),
-            })
-
-            logger.debug(
-                f"Component '{product_name_full}': "
-                f"need={qty_needed}, have={qty_available}, shortage={shortage}"
-            )
-
-        # ── Step 4: Return complete result ────────────────────────────────────
-        result = {
-            "found": True,
-            "bom_id": bom_id,
-            "finished_product": finished_product,
-            "produces_qty": produces_qty,
-            "uom": uom,
-            "total_components": len(components),
-            "has_shortages": has_shortages,
-            "shortage_count": sum(1 for c in components if c["shortage"]),
-            "components": components,
-        }
-
-        logger.info(
-            f"get_bom_with_stock complete: {len(components)} components, "
-            f"shortages={has_shortages}"
-        )
-
-        return result
+        except xmlrpc.client.Fault as e:
+            logger.error(f"Odoo fault in get_bom_with_stock: {e}")
+            return {"error": f"Odoo rejected the request: {str(e)}"}
+        except socket.timeout:
+            logger.error("Timeout in get_bom_with_stock")
+            return {"error": "Odoo took too long to respond. Please try again."}
+        except Exception as e:
+            logger.error(f"Unexpected error in get_bom_with_stock: {e}")
+            return {"error": f"Unexpected error: {str(e)}"}
 
 # ── Multi-level BOM explosion ──────────────────────────────────────────
 
@@ -527,52 +599,70 @@ class CSAToolHandler:
         product_name -- full or partial name or internal reference
         qty          -- how many finished units you want to build (default 1)
         """
+        try:
+            params = ShortageInput(product_name=product_name, qty=qty)
+            product_name = params.product_name
+            qty = params.qty
+        except ValueError as e:
+            return {"error": str(e)}
+
         logger.info(
             f"get_shortage_report called: product='{product_name}' qty={qty}"
         )
+        try:
+    
+            # Step 1: Explode the BOM fully
+            explosion = self.explode_bom_multilevel(product_name, qty)
 
-        # Step 1: Explode the BOM fully
-        explosion = self.explode_bom_multilevel(product_name, qty)
+            if not explosion["found"]:
+                return {
+                    "found": False,
+                    "product_name": product_name,
+                    "message": explosion["message"],
+                    "shortages": [],
+                }
 
-        if not explosion["found"]:
+            # Step 2: Check stock for each raw material
+            shortages = []
+            for item in explosion["raw_materials"]:
+                qty_available = self._check_stock_for_product(item["product_id"])
+                qty_needed = item["qty_needed"]
+
+                if qty_available < qty_needed:
+                    shortages.append({
+                        "product_id": item["product_id"],
+                        "product_name": item["product_name"],
+                        "qty_needed": round(qty_needed, 2),
+                        "qty_available": round(qty_available, 2),
+                        "shortage_qty": round(qty_needed - qty_available, 2),
+                        "uom": item["uom"],
+                    })
+
+            logger.info(
+                f"get_shortage_report complete: '{explosion['finished_product']}' "
+                f"qty={qty} -> {len(shortages)} shortages out of "
+                f"{explosion['total_unique_raw_materials']} raw materials"
+            )
+
             return {
-                "found": False,
-                "product_name": product_name,
-                "message": explosion["message"],
-                "shortages": [],
+                "found": True,
+                "finished_product": explosion["finished_product"],
+                "qty_requested": qty,
+                "total_raw_materials": explosion["total_unique_raw_materials"],
+                "shortage_count": len(shortages),
+                "has_shortages": len(shortages) > 0,
+                "shortages": shortages,
             }
 
-        # Step 2: Check stock for each raw material
-        shortages = []
-        for item in explosion["raw_materials"]:
-            qty_available = self._check_stock_for_product(item["product_id"])
-            qty_needed = item["qty_needed"]
-
-            if qty_available < qty_needed:
-                shortages.append({
-                    "product_id": item["product_id"],
-                    "product_name": item["product_name"],
-                    "qty_needed": round(qty_needed, 2),
-                    "qty_available": round(qty_available, 2),
-                    "shortage_qty": round(qty_needed - qty_available, 2),
-                    "uom": item["uom"],
-                })
-
-        logger.info(
-            f"get_shortage_report complete: '{explosion['finished_product']}' "
-            f"qty={qty} -> {len(shortages)} shortages out of "
-            f"{explosion['total_unique_raw_materials']} raw materials"
-        )
-
-        return {
-            "found": True,
-            "finished_product": explosion["finished_product"],
-            "qty_requested": qty,
-            "total_raw_materials": explosion["total_unique_raw_materials"],
-            "shortage_count": len(shortages),
-            "has_shortages": len(shortages) > 0,
-            "shortages": shortages,
-        }
+        except xmlrpc.client.Fault as e:
+            logger.error(f"Odoo fault in get_shortage_report: {e}")
+            return {"error": f"Odoo rejected the request: {str(e)}"}
+        except socket.timeout:
+            logger.error("Timeout in get_shortage_report")
+            return {"error": "Odoo took too long to respond. Please try again."}
+        except Exception as e:
+            logger.error(f"Unexpected error in get_shortage_report: {e}")
+            return {"error": f"Unexpected error: {str(e)}"}
 
     def _get_vendor_info_for_product(self, product_id: int, qty_needed: float):
         """
@@ -662,56 +752,74 @@ class CSAToolHandler:
         product_name -- full or partial name or internal reference
         qty          -- how many finished units you want to build (default 1)
         """
+        try:
+            params = VendorInput(product_name=product_name, qty=qty)
+            product_name = params.product_name
+            qty = params.qty
+        except ValueError as e:
+            return {"error": str(e)}
+
         logger.info(
             f"get_vendor_lead_times called: product='{product_name}' qty={qty}"
         )
+        try:
 
-        # Step 1: Explode the BOM to get all raw materials
-        explosion = self.explode_bom_multilevel(product_name, qty)
+            # Step 1: Explode the BOM to get all raw materials
+            explosion = self.explode_bom_multilevel(product_name, qty)
 
-        if not explosion["found"]:
-            return {
-                "found": False,
-                "product_name": product_name,
-                "message": explosion["message"],
-                "components": [],
-            }
+            if not explosion["found"]:
+                return {
+                    "found": False,
+                    "product_name": product_name,
+                    "message": explosion["message"],
+                    "components": [],
+                }
 
-        # Step 2: For each raw material, fetch vendor info
-        components = []
-        no_vendor_count = 0
+            # Step 2: For each raw material, fetch vendor info
+            components = []
+            no_vendor_count = 0
 
-        for item in explosion["raw_materials"]:
-            vendors, recommended = self._get_vendor_info_for_product(
-                item["product_id"],
-                item["qty_needed"],
+            for item in explosion["raw_materials"]:
+                vendors, recommended = self._get_vendor_info_for_product(
+                    item["product_id"],
+                    item["qty_needed"],
+                )
+
+                has_vendor = len(vendors) > 0
+                if not has_vendor:
+                    no_vendor_count += 1
+
+                components.append({
+                    "product_id": item["product_id"],
+                    "product_name": item["product_name"],
+                    "qty_needed": item["qty_needed"],
+                    "uom": item["uom"],
+                    "has_vendor": has_vendor,
+                    "recommended_vendor": recommended,
+                    "vendors": vendors,
+                })
+
+            logger.info(
+                f"get_vendor_lead_times complete: '{explosion['finished_product']}' "
+                f"qty={qty} -> {len(components)} components, "
+                f"{no_vendor_count} missing vendors"
             )
 
-            has_vendor = len(vendors) > 0
-            if not has_vendor:
-                no_vendor_count += 1
+            return {
+                "found": True,
+                "finished_product": explosion["finished_product"],
+                "qty_requested": qty,
+                "total_components": len(components),
+                "no_vendor_count": no_vendor_count,
+                "components": components,
+            }
 
-            components.append({
-                "product_id": item["product_id"],
-                "product_name": item["product_name"],
-                "qty_needed": item["qty_needed"],
-                "uom": item["uom"],
-                "has_vendor": has_vendor,
-                "recommended_vendor": recommended,
-                "vendors": vendors,
-            })
-
-        logger.info(
-            f"get_vendor_lead_times complete: '{explosion['finished_product']}' "
-            f"qty={qty} -> {len(components)} components, "
-            f"{no_vendor_count} missing vendors"
-        )
-
-        return {
-            "found": True,
-            "finished_product": explosion["finished_product"],
-            "qty_requested": qty,
-            "total_components": len(components),
-            "no_vendor_count": no_vendor_count,
-            "components": components,
-        }
+        except xmlrpc.client.Fault as e:
+            logger.error(f"Odoo fault in get_vendor_lead_times: {e}")
+            return {"error": f"Odoo rejected the request: {str(e)}"}
+        except socket.timeout:
+            logger.error("Timeout in get_vendor_lead_times")
+            return {"error": "Odoo took too long to respond. Please try again."}
+        except Exception as e:
+            logger.error(f"Unexpected error in get_vendor_lead_times: {e}")
+            return {"error": f"Unexpected error: {str(e)}"}
