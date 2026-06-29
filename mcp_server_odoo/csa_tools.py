@@ -1064,3 +1064,76 @@ class CSAToolHandler:
         except Exception as e:
             logger.error(f"Unexpected error in what_can_i_build_today: {e}")
             return {"error": f"Unexpected error: {str(e)}"}
+            
+    def simulate_order(self, product_name: str, qty: float = 1.0) -> dict:
+        """
+        Simulate a production order: shows materials needed, stock available,
+        shortages, and how many units can actually be built.
+        """
+        try:
+            params = ShortageInput(product_name=product_name, qty=qty)
+            product_name = params.product_name
+            qty = params.qty
+
+            explosion = self.explode_bom_multilevel(product_name, qty)
+            if "error" in explosion:
+                return explosion
+
+            materials = explosion.get("components", [])
+            if not materials:
+                return {"error": f"No BOM components found for '{product_name}'"}
+
+            shortage_result = self.get_shortage_report(product_name, qty)
+            shortages = shortage_result.get("shortages", []) if "error" not in shortage_result else []
+
+            shortage_map = {s["product_name"]: s for s in shortages}
+
+            max_buildable = None
+            for mat in materials:
+                qty_needed_per_unit = mat["qty_needed"] / qty
+                if qty_needed_per_unit <= 0:
+                    continue
+                stock = mat.get("stock_qty", 0.0)
+                possible = stock / qty_needed_per_unit
+                if max_buildable is None or possible < max_buildable:
+                    max_buildable = possible
+
+            if max_buildable is None:
+                max_buildable = 0.0
+
+            summary = []
+            for mat in materials:
+                shortage_info = shortage_map.get(mat["product_name"])
+                summary.append({
+                    "product_name": mat["product_name"],
+                    "qty_needed": mat["qty_needed"],
+                    "uom": mat.get("uom", ""),
+                    "stock_qty": mat.get("stock_qty", 0.0),
+                    "is_short": shortage_info is not None,
+                    "shortage_qty": shortage_info["shortage_qty"] if shortage_info else 0.0,
+                })
+
+            short_items = [s for s in summary if s["is_short"]]
+
+            logger.info(f"simulate_order complete for '{product_name}' qty={qty}")
+            return {
+                "product_name": product_name,
+                "requested_qty": qty,
+                "max_buildable_qty": round(max_buildable, 2),
+                "can_fulfill": max_buildable >= qty,
+                "total_materials": len(summary),
+                "shortage_count": len(short_items),
+                "materials": summary,
+            }
+
+        except xmlrpc.client.Fault as e:
+            logger.error(f"Odoo fault in simulate_order: {e}")
+            return {"error": f"Odoo rejected the request: {str(e)}"}
+        except socket.timeout:
+            logger.error("Timeout in simulate_order")
+            return {"error": "Odoo took too long to respond. Please try again."}
+        except Exception as e:
+            logger.error(f"Unexpected error in simulate_order: {e}")
+            return {"error": f"Unexpected error: {str(e)}"}
+            
+            
