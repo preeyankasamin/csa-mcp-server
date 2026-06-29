@@ -1136,4 +1136,73 @@ class CSAToolHandler:
             logger.error(f"Unexpected error in simulate_order: {e}")
             return {"error": f"Unexpected error: {str(e)}"}
             
-            
+    def cost_estimate(self, product_name: str, qty: float = 1.0) -> dict:
+        """
+        Estimate total material cost to build qty units of a product.
+        Uses BOM explosion + vendor pricelist data.
+        """
+        try:
+            params = ShortageInput(product_name=product_name, qty=qty)
+            product_name = params.product_name
+            qty = params.qty
+
+            explosion = self.explode_bom_multilevel(product_name, qty)
+            if "error" in explosion:
+                return explosion
+
+            materials = explosion.get("components", [])
+            if not materials:
+                return {"error": f"No BOM components found for '{product_name}'"}
+
+            vendor_result = self.get_vendor_lead_times(product_name, qty)
+            vendor_map = {}
+            if "error" not in vendor_result:
+                for item in vendor_result.get("materials", []):
+                    pname = item.get("product_name")
+                    recommended = item.get("recommended_vendor")
+                    if pname and recommended:
+                        vendor_map[pname] = recommended.get("unit_price", 0.0)
+
+            line_items = []
+            total_cost = 0.0
+            missing_price_count = 0
+
+            for mat in materials:
+                pname = mat["product_name"]
+                qty_needed = mat["qty_needed"]
+                unit_price = vendor_map.get(pname, 0.0)
+                line_cost = qty_needed * unit_price
+                total_cost += line_cost
+
+                if unit_price == 0.0:
+                    missing_price_count += 1
+
+                line_items.append({
+                    "product_name": pname,
+                    "qty_needed": qty_needed,
+                    "uom": mat.get("uom", ""),
+                    "unit_price": unit_price,
+                    "line_cost": round(line_cost, 2),
+                    "price_available": unit_price > 0.0,
+                })
+
+            logger.info(f"cost_estimate complete for '{product_name}' qty={qty}, total={total_cost}")
+            return {
+                "product_name": product_name,
+                "requested_qty": qty,
+                "total_cost": round(total_cost, 2),
+                "currency": "INR",
+                "total_materials": len(line_items),
+                "missing_price_count": missing_price_count,
+                "line_items": line_items,
+            }
+
+        except xmlrpc.client.Fault as e:
+            logger.error(f"Odoo fault in cost_estimate: {e}")
+            return {"error": f"Odoo rejected the request: {str(e)}"}
+        except socket.timeout:
+            logger.error("Timeout in cost_estimate")
+            return {"error": "Odoo took too long to respond. Please try again."}
+        except Exception as e:
+            logger.error(f"Unexpected error in cost_estimate: {e}")
+            return {"error": f"Unexpected error: {str(e)}"}
