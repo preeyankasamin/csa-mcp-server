@@ -823,3 +823,244 @@ class CSAToolHandler:
         except Exception as e:
             logger.error(f"Unexpected error in get_vendor_lead_times: {e}")
             return {"error": f"Unexpected error: {str(e)}"}
+            
+    def explain_bom(
+        self,
+        product_name: str,
+        qty: float = 1.0,
+    ):
+        """
+        Returns a plain-English explanation of the top-level BOM for a product.
+        Shows which components are sub-assemblies (have their own BOM)
+        and which are raw materials (no BOM, bought directly).
+
+        product_name -- full or partial name or internal reference
+        qty          -- how many finished units (default 1)
+        """
+        try:
+            params = BomInput(product_name=product_name, qty=qty)
+            product_name = params.product_name
+            qty = params.qty
+        except ValueError as e:
+            return {"error": str(e)}
+
+        logger.info(f"explain_bom called: product='{product_name}' qty={qty}")
+
+        try:
+            # Step 1: Find the top-level BOM
+            bom_records = self.connection.execute_kw(
+                "mrp.bom",
+                "search_read",
+                [["|",
+                  ["product_tmpl_id.name", "ilike", product_name],
+                  ["product_tmpl_id.default_code", "ilike", product_name]]],
+                {
+                    "fields": [
+                        "id",
+                        "product_tmpl_id",
+                        "product_qty",
+                        "product_uom_id",
+                        "bom_line_ids",
+                    ],
+                    "limit": 1,
+                },
+            )
+
+            if not bom_records:
+                return {
+                    "found": False,
+                    "product_name": product_name,
+                    "message": f"No BOM found for '{product_name}'.",
+                    "components": [],
+                }
+
+            bom = bom_records[0]
+            bom_id = bom["id"]
+            finished_product = bom["product_tmpl_id"][1]
+            produces_qty = bom["product_qty"]
+            uom = bom["product_uom_id"][1]
+
+            # Step 2: Fetch direct component lines (one level only)
+            bom_lines = self.connection.execute_kw(
+                "mrp.bom.line",
+                "search_read",
+                [[["bom_id", "=", bom_id]]],
+                {
+                    "fields": [
+                        "product_id",
+                        "product_qty",
+                        "product_uom_id",
+                    ]
+                },
+            )
+
+            if not bom_lines:
+                return {
+                    "found": True,
+                    "finished_product": finished_product,
+                    "produces_qty": produces_qty,
+                    "uom": uom,
+                    "message": "BOM exists but has no components.",
+                    "total_components": 0,
+                    "sub_assembly_count": 0,
+                    "raw_material_count": 0,
+                    "components": [],
+                }
+
+            # Step 3: For each component, check if it has its own BOM
+            # If it does -> sub-assembly. If not -> raw material.
+            components = []
+            sub_assembly_count = 0
+            raw_material_count = 0
+
+            for line in bom_lines:
+                comp_product_id = line["product_id"][0]   # numeric ID
+                comp_name = line["product_id"][1]          # display name
+                comp_qty = line["product_qty"] * qty       # scaled by requested qty
+                comp_uom = line["product_uom_id"][1]
+
+                # Check if this component has its own BOM
+                sub_bom = self._get_bom_for_product_id(comp_product_id)
+                is_sub_assembly = sub_bom is not None
+
+                if is_sub_assembly:
+                    sub_assembly_count += 1
+                    component_type = "sub_assembly"
+                else:
+                    raw_material_count += 1
+                    component_type = "raw_material"
+
+                components.append({
+                    "product_id": comp_product_id,
+                    "product_name": comp_name,
+                    "qty_needed": round(comp_qty, 4),
+                    "uom": comp_uom,
+                    "type": component_type,
+                })
+
+            logger.info(
+                f"explain_bom complete: '{finished_product}' has "
+                f"{len(components)} components "
+                f"({sub_assembly_count} sub-assemblies, {raw_material_count} raw materials)"
+            )
+
+            return {
+                "found": True,
+                "finished_product": finished_product,
+                "produces_qty": produces_qty,
+                "uom": uom,
+                "qty_requested": qty,
+                "total_components": len(components),
+                "sub_assembly_count": sub_assembly_count,
+                "raw_material_count": raw_material_count,
+                "summary": (
+                    f"'{finished_product}' has {len(components)} direct components: "
+                    f"{sub_assembly_count} sub-assemblies (each has its own BOM) "
+                    f"and {raw_material_count} raw materials (bought directly)."
+                ),
+                "components": components,
+            }
+
+        except xmlrpc.client.Fault as e:
+            logger.error(f"Odoo fault in explain_bom: {e}")
+            return {"error": f"Odoo rejected the request: {str(e)}"}
+        except socket.timeout:
+            logger.error("Timeout in explain_bom")
+            return {"error": "Odoo took too long to respond. Please try again."}
+        except Exception as e:
+            logger.error(f"Unexpected error in explain_bom: {e}")
+            return {"error": f"Unexpected error: {str(e)}"}
+    
+    def what_can_i_build_today(self):
+        """
+        Scans all products that have a BOM in Odoo.
+        For each product, runs a full shortage check.
+        Returns two lists:
+          - can_build: products with zero shortages (all parts in stock)
+          - cannot_build: products with at least one shortage
+
+        No arguments needed -- scans everything automatically.
+        """
+        logger.info("what_can_i_build_today called")
+
+        try:
+            # Step 1: Fetch all BOMs (just the product name, no lines needed)
+            bom_records = self.connection.execute_kw(
+                "mrp.bom",
+                "search_read",
+                [[]],   # empty domain = fetch ALL BOMs
+                {
+                    "fields": [
+                        "id",
+                        "product_tmpl_id",
+                        "product_qty",
+                        "product_uom_id",
+                    ],
+                },
+            )
+
+            if not bom_records:
+                return {
+                    "total_products_checked": 0,
+                    "can_build": [],
+                    "cannot_build": [],
+                    "message": "No BOMs found in Odoo.",
+                }
+
+            can_build = []
+            cannot_build = []
+
+            # Step 2: For each BOM, run a shortage check
+            for bom in bom_records:
+                finished_product = bom["product_tmpl_id"][1]  # product display name
+                produces_qty = bom["product_qty"]
+                uom = bom["product_uom_id"][1]
+
+                shortage_result = self.get_shortage_report(
+                    product_name=finished_product,
+                    qty=produces_qty,
+                )
+
+                # If error (e.g. Odoo timeout on one product), skip it
+                if "error" in shortage_result:
+                    logger.warning(
+                        f"Skipping '{finished_product}' due to error: "
+                        f"{shortage_result['error']}"
+                    )
+                    continue
+
+                entry = {
+                    "product_name": finished_product,
+                    "produces_qty": produces_qty,
+                    "uom": uom,
+                    "total_raw_materials": shortage_result.get("total_raw_materials", 0),
+                    "shortage_count": shortage_result.get("shortage_count", 0),
+                }
+
+                if shortage_result["shortage_count"] == 0:
+                    can_build.append(entry)
+                else:
+                    cannot_build.append(entry)
+
+            logger.info(
+                f"what_can_i_build_today complete: "
+                f"{len(can_build)} can build, {len(cannot_build)} cannot build"
+            )
+
+            return {
+                "total_products_checked": len(can_build) + len(cannot_build),
+                "can_build_count": len(can_build),
+                "cannot_build_count": len(cannot_build),
+                "can_build": can_build,
+                "cannot_build": cannot_build,
+            }
+
+        except xmlrpc.client.Fault as e:
+            logger.error(f"Odoo fault in what_can_i_build_today: {e}")
+            return {"error": f"Odoo rejected the request: {str(e)}"}
+        except socket.timeout:
+            logger.error("Timeout in what_can_i_build_today")
+            return {"error": "Odoo took too long to respond. Please try again."}
+        except Exception as e:
+            logger.error(f"Unexpected error in what_can_i_build_today: {e}")
+            return {"error": f"Unexpected error: {str(e)}"}
