@@ -1206,3 +1206,83 @@ class CSAToolHandler:
         except Exception as e:
             logger.error(f"Unexpected error in cost_estimate: {e}")
             return {"error": f"Unexpected error: {str(e)}"}
+            
+    def vendor_comparison(self, product_name: str) -> dict:
+        """
+        Compare all vendors for a single product side by side.
+        Returns price, lead time, and minimum order qty for each vendor.
+        """
+        try:
+            params = BomInput(product_name=product_name, qty=1.0)
+            product_name = params.product_name
+
+            products = self.connection.execute_kw(
+                "product.product",
+                "search_read",
+                [["|",
+                  ["name", "ilike", product_name],
+                  ["default_code", "ilike", product_name]]],
+                {"fields": ["id", "name", "default_code"], "limit": 10},
+            )
+
+            if not products:
+                return {"error": f"No product found matching '{product_name}'"}
+
+            product = products[0]
+            product_id = product["id"]
+            product_display_name = product["name"]
+            internal_ref = product.get("default_code") or ""
+
+            suppliers = self.connection.execute_kw(
+                "product.supplierinfo",
+                "search_read",
+                [[["product_id", "=", product_id]]],
+                {"fields": ["partner_id", "price", "delay", "min_qty", "currency_id"]},
+            )
+
+            if not suppliers:
+                suppliers = self.connection.execute_kw(
+                    "product.supplierinfo",
+                    "search_read",
+                    [[["product_tmpl_id.product_variant_ids", "in", [product_id]]]],
+                    {"fields": ["partner_id", "price", "delay", "min_qty", "currency_id"]},
+                )
+
+            if not suppliers:
+                return {
+                    "product_name": product_display_name,
+                    "internal_ref": internal_ref,
+                    "vendor_count": 0,
+                    "vendors": [],
+                    "message": "No vendors found for this product in Odoo.",
+                }
+
+            vendors = []
+            for s in suppliers:
+                vendors.append({
+                    "vendor_name": s["partner_id"][1] if s.get("partner_id") else "Unknown",
+                    "unit_price": s.get("price", 0.0),
+                    "currency": s["currency_id"][1] if s.get("currency_id") else "INR",
+                    "lead_time_days": s.get("delay", 0),
+                    "min_qty": s.get("min_qty", 0.0),
+                })
+
+            vendors.sort(key=lambda v: (v["unit_price"], v["lead_time_days"]))
+
+            logger.info(f"vendor_comparison complete for '{product_name}': {len(vendors)} vendors found")
+            return {
+                "product_name": product_display_name,
+                "internal_ref": internal_ref,
+                "vendor_count": len(vendors),
+                "vendors": vendors,
+            }
+
+        except xmlrpc.client.Fault as e:
+            logger.error(f"Odoo fault in vendor_comparison: {e}")
+            return {"error": f"Odoo rejected the request: {str(e)}"}
+        except socket.timeout:
+            logger.error("Timeout in vendor_comparison")
+            return {"error": "Odoo took too long to respond. Please try again."}
+        except Exception as e:
+            logger.error(f"Unexpected error in vendor_comparison: {e}")
+            return {"error": f"Unexpected error: {str(e)}"}
