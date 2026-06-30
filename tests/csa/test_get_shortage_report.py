@@ -51,6 +51,9 @@ class FakeHandler:
     def __init__(self):
         from mcp_server_odoo.csa_tools import CSAToolHandler
         self.connection = FakeConnection()
+        self._cache = {}
+        self._cache_get = lambda key: CSAToolHandler._cache_get(self, key)
+        self._cache_set = lambda key, val: CSAToolHandler._cache_set(self, key, val)
         self._get_bom_for_product_id = lambda pid: CSAToolHandler._get_bom_for_product_id(self, pid)
         self._explode = lambda *a, **kw: CSAToolHandler._explode(self, *a, **kw)
         self.explode_bom_multilevel = lambda *a, **kw: CSAToolHandler.explode_bom_multilevel(self, *a, **kw)

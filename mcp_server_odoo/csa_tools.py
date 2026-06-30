@@ -18,6 +18,7 @@ from .logging_config import get_logger, perf_logger
 # If Odoo does not respond within this time, raise a clean error
 ODOO_XMLRPC_TIMEOUT = 30
 from .odoo_connection import OdooConnection
+from .csa_audit_log import log_tool_call
 
 # Creates a logger named 'mcp_server_odoo.csa_tools'
 # Every log line from this file will be tagged with this name
@@ -98,7 +99,21 @@ class CSAToolHandler:
         self.connection = connection
         self._register_csa_tools()
         socket.setdefaulttimeout(ODOO_XMLRPC_TIMEOUT)
+        self._cache = {}
 
+    def _cache_get(self, key: str):
+        """Return cached value if exists and under 5 minutes old, else None."""
+        import time
+        entry = self._cache.get(key)
+        if entry and (time.time() - entry["ts"]) < 300:
+            return entry["val"]
+        return None
+
+    def _cache_set(self, key: str, value):
+        """Save a value into the cache with current timestamp."""
+        import time
+        self._cache[key] = {"val": value, "ts": time.time()}
+        
     def _register_csa_tools(self):
         """Registers all CSA tools into the FastMCP app."""
 
@@ -152,6 +167,10 @@ class CSAToolHandler:
         except ValueError as e:
             return {"error": str(e)}
 
+        cache_key = f"get_bom_with_stock::{product_name}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         logger.info(f"get_bom_with_stock called for product: '{product_name}'")
         try:
 
@@ -290,6 +309,8 @@ class CSAToolHandler:
                 f"shortages={has_shortages}"
             )
 
+            self._cache_set(cache_key, result)
+            log_tool_call("get_bom_with_stock", {"product_name": product_name}, result, cached=False)
             return result
 
         except xmlrpc.client.Fault as e:
@@ -606,6 +627,10 @@ class CSAToolHandler:
         except ValueError as e:
             return {"error": str(e)}
 
+        cache_key = f"get_shortage_report::{product_name}::{qty}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         logger.info(
             f"get_shortage_report called: product='{product_name}' qty={qty}"
         )
@@ -644,7 +669,7 @@ class CSAToolHandler:
                 f"{explosion['total_unique_raw_materials']} raw materials"
             )
 
-            return {
+            result = {
                 "found": True,
                 "finished_product": explosion["finished_product"],
                 "qty_requested": qty,
@@ -653,6 +678,9 @@ class CSAToolHandler:
                 "has_shortages": len(shortages) > 0,
                 "shortages": shortages,
             }
+            self._cache_set(cache_key, result)
+            log_tool_call("get_shortage_report", {"product_name": product_name, "qty": qty}, result, cached=False)
+            return result
 
         except xmlrpc.client.Fault as e:
             logger.error(f"Odoo fault in get_shortage_report: {e}")
@@ -759,6 +787,10 @@ class CSAToolHandler:
         except ValueError as e:
             return {"error": str(e)}
 
+        cache_key = f"get_vendor_lead_times::{product_name}::{qty}"
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
         logger.info(
             f"get_vendor_lead_times called: product='{product_name}' qty={qty}"
         )
@@ -805,7 +837,7 @@ class CSAToolHandler:
                 f"{no_vendor_count} missing vendors"
             )
 
-            return {
+            result = {
                 "found": True,
                 "finished_product": explosion["finished_product"],
                 "qty_requested": qty,
@@ -813,6 +845,9 @@ class CSAToolHandler:
                 "no_vendor_count": no_vendor_count,
                 "components": components,
             }
+            self._cache_set(cache_key, result)
+            log_tool_call("get_vendor_lead_times", {"product_name": product_name, "qty": qty}, result, cached=False)
+            return result
 
         except xmlrpc.client.Fault as e:
             logger.error(f"Odoo fault in get_vendor_lead_times: {e}")
