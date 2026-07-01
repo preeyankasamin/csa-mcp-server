@@ -13,6 +13,8 @@ PREEYANKA = {
     "work_email": "preeyanka@mechtrace.com",
 }
 
+# Karthik S - Senior Purchase Executive - hr.employee id 973 in CS Aerotherm
+KARTHIK_EMPLOYEE_ID = 973
 # Pranav Jairam - Managing Director - hr.employee id 995 in CS Aerotherm
 MD_EMPLOYEE_ID = 995
 
@@ -39,6 +41,26 @@ def get_admin_contacts(conn) -> list[dict]:
         })
 
     return contacts
+
+def get_karthik_contact(conn) -> dict | None:
+    """
+    Return contact info for Karthik S (Senior Purchase Executive).
+    Used for work_order_stuck alerts.
+    conn -- an authenticated OdooConnection
+    """
+    records = conn.search_read(
+        "hr.employee",
+        [["id", "=", KARTHIK_EMPLOYEE_ID]],
+        fields=["name", "mobile_phone", "work_email"],
+    )
+    if not records:
+        return None
+    k = records[0]
+    return {
+        "name": k["name"],
+        "mobile_phone": k.get("mobile_phone"),
+        "work_email": k.get("work_email"),
+    }
 
 
 def get_work_order_contacts(conn, work_order_id: int) -> dict:
