@@ -102,6 +102,10 @@ class OdooMCPServer:
 
         logger.info(f"Initialized Odoo MCP Server v{SERVER_VERSION}")
 
+        # Start CSA watcher scheduler (Stock Alert Watcher, runs daily 2 AM)
+        from mcp_server_odoo.csa_scheduler import start_scheduler
+        self.csa_scheduler = start_scheduler()
+
     @contextlib.asynccontextmanager
     async def _odoo_lifespan(self, app: FastMCP):
         """Manage Odoo connection lifecycle for FastMCP.
